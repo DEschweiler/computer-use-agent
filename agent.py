@@ -1131,7 +1131,7 @@ class ComputerAgent:
                     "Your last action may have had no effect — reassess before repeating."
                 )
             if self._no_change_streak >= 3:
-                note += "\n🛑 Consider a completely different approach."
+                note += "\nConsider a completely different approach."
                 log.warning("Screen stuck for %d iterations", self._no_change_streak)
             if self._no_change_streak >= 5:
                 log.error("Screen unchanged for %d consecutive iterations — aborting.",
