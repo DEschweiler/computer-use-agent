@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+hack_env/
+
+# Environment variables and secrets
+.env
+.env.local
+*.key
+*.pem
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and screenshots
+*.log
+screenshots/
+logs/
+
+# Frontend build and source files
+frontend/node_modules/
+frontend/src/

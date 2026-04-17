@@ -1,0 +1,12 @@
+[project]
+name = "hackathon"
+version = "0.1.0"
+description = "HospitalRun Navigation Agent using Azure OpenAI Computer Use"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "pyautogui>=0.9.54",
+    "pillow>=10.0.0",
+]
