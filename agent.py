@@ -67,7 +67,7 @@ elif platform.system() == "Windows":
     if _default.exists():
         pytesseract.pytesseract.tesseract_cmd = str(_default)
 
-# OCR language: env var (e.g. "deu+eng") overrides the default.
+# OCR language: env var
 OCR_LANG = os.getenv("OCR_LANG", "eng")
 
 logging.basicConfig(
