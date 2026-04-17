@@ -31,6 +31,9 @@ pyobjc-framework-quartz==12.1
 pyperclip==1.11.0
 pyrect==0.2.0
 pyscreeze==1.0.1
+opencv-python
+numpy
+pytesseract
 paddlepaddle
 paddleocr
 python-dotenv==1.2.1
