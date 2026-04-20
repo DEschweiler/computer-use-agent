@@ -1056,6 +1056,8 @@ class ComputerAgent:
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
         nudge_count = 0
+        last_action_sig: Optional[str] = None
+        repeat_streak = 0
 
         for iteration in range(self.cfg.max_iterations):
             log.info("--- iteration %d ---", iteration + 1)
@@ -1145,6 +1147,17 @@ class ComputerAgent:
             if task_done:
                 break
 
+            # Build a fingerprint of this iteration's tool calls for repeat detection.
+            action_sig = "|".join(
+                f"{tc['function']['name']}:{tc['function'].get('arguments','')}"
+                for tc in tool_calls
+            )
+            if action_sig and action_sig == last_action_sig:
+                repeat_streak += 1
+            else:
+                repeat_streak = 0
+            last_action_sig = action_sig or last_action_sig
+
             # Observe the new screen state.
             time.sleep(0.8)
             screenshot_b64, elements = self._parse_screen()
@@ -1157,13 +1170,12 @@ class ComputerAgent:
 
             note = ""
             if self._no_change_streak >= 1:
-                note = (
-                    f"⚠ Screen text unchanged for {self._no_change_streak} action(s). "
-                    "Your last action may have had no effect — reassess before repeating."
-                )
+                note = f"⚠ Screen unchanged for {self._no_change_streak} iteration(s) — try a different action."
             if self._no_change_streak >= 3:
-                note += "\nConsider a completely different approach."
+                note += " Consider an entirely different approach."
                 log.warning("Screen stuck for %d iterations", self._no_change_streak)
+            if repeat_streak >= 1:
+                note += f" You have repeated the same action(s) {repeat_streak + 1} time(s) in a row."
             if self._no_change_streak >= 5:
                 log.error("Screen unchanged for %d consecutive iterations — aborting.",
                           self._no_change_streak)

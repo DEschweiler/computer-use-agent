@@ -106,6 +106,7 @@ function App() {
       if (!response.ok) throw new Error('Failed to start task');
 
       let finalAnswer = null;
+      let aborted = false;
       const eventSource = new EventSource(`${API}/api/logs`);
       eventSourceRef.current = eventSource;
 
@@ -117,9 +118,16 @@ function App() {
           eventSourceRef.current = null;
           setIsRunning(false);
           setMessages(prev => [...prev, {
-            type: 'agent',
-            content: finalAnswer || 'Task completed! Check debug logs for details.'
+            type: aborted ? 'error' : 'agent',
+            content: aborted
+              ? 'Task aborted: the screen stopped changing. Check the debug logs.'
+              : (finalAnswer || 'Task completed! Check debug logs for details.')
           }]);
+          return;
+        }
+
+        if (data.startsWith('[ABORTED]')) {
+          aborted = true;
           return;
         }
 
