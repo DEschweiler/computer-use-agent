@@ -9,6 +9,8 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const [debugExpanded, setDebugExpanded] = useState(false);
+  const [panelHeight, setPanelHeight] = useState(300);
+  const dragStateRef = useRef(null); // { startY, startHeight }
   const [screenshotTs, setScreenshotTs] = useState(null);
   const [screenshotOk, setScreenshotOk] = useState(false);
   const [modelInfo, setModelInfo] = useState(null);
@@ -16,6 +18,21 @@ function App() {
   const logsEndRef = useRef(null);
   const eventSourceRef = useRef(null);
   const screenshotTimerRef = useRef(null);
+
+  const handleResizeMouseDown = (e) => {
+    e.preventDefault();
+    dragStateRef.current = { startY: e.clientY, startHeight: panelHeight };
+    const onMove = (ev) => {
+      const delta = dragStateRef.current.startY - ev.clientY;
+      setPanelHeight(Math.max(80, dragStateRef.current.startHeight + delta));
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
 
   // Fetch model info once on mount
   useEffect(() => {
@@ -222,7 +239,9 @@ function App() {
           </div>
 
           {debugExpanded && (
-            <div className="debug-row-content">
+            <>
+            <div className="debug-resize-handle" onMouseDown={handleResizeMouseDown} />
+            <div className="debug-row-content" style={{ height: panelHeight }}>
               {/* Logs */}
               <div className="debug-content">
                 {debugLogs.length === 0 ? (
@@ -259,6 +278,7 @@ function App() {
                 )}
               </div>
             </div>
+            </>
           )}
         </div>
       </div>

@@ -311,6 +311,20 @@ body {
   gap: 0.75rem;
   font-weight: 600;
   transition: background 0.2s;
+  user-select: none;
+}
+
+.debug-resize-handle {
+  height: 5px;
+  background: #1a1a1a;
+  cursor: ns-resize;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.debug-resize-handle:hover,
+.debug-resize-handle:active {
+  background: #3b82f6;
 }
 
 .debug-row-header:hover {
@@ -331,7 +345,7 @@ body {
 
 .debug-row-content {
   display: flex;
-  height: 300px;
+  /* height is set via inline style from React state */
   border-top: 1px solid #1a1a1a;
 }
 
