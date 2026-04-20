@@ -213,6 +213,28 @@ COMPUTER_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": (
+                "Perform integer arithmetic to derive precise pixel coordinates. "
+                "Use this when you need a position that is not directly available as an "
+                "element_id — e.g. the midpoint between two OCR elements, or an offset "
+                "from a known coordinate. Supports addition and subtraction only. "
+                "Returns the integer result so you can feed it into x/y of click/scroll."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer", "description": "First operand (pixel value)."},
+                    "op": {"type": "string", "enum": ["+", "-"], "description": "Operator: '+' or '-'."},
+                    "b": {"type": "integer", "description": "Second operand (pixel value)."},
+                },
+                "required": ["a", "op", "b"],
+            },
+        },
+    },
 ]
 
 # --- DPI awareness --------------------------------------------------------- #
@@ -647,6 +669,15 @@ class ActionExecutor:
                 if not title:
                     return "error: no title provided"
                 return self._focus_window(title)
+
+            if action_type == "calculate":
+                a = args.get("a")
+                op = args.get("op")
+                b = args.get("b")
+                if a is None or b is None or op not in ("+", "-"):
+                    return "error: calculate requires integer args 'a', 'b' and op '+' or '-'"
+                result = int(a) + int(b) if op == "+" else int(a) - int(b)
+                return f"result: {result}"
 
             return f"error: unknown action {action_type}"
 
