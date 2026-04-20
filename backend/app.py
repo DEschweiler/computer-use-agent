@@ -67,7 +67,15 @@ def run_agent_task_proc(task, log_queue):
         log_queue.put(f"[SYSTEM] Starting task: {task}\n")
         result = agent.run(task)
         actions = result["actions"]
+        # Extract the final answer from the last verified task_complete action
+        final_answer = None
+        for action in reversed(actions):
+            if action.get("action") == "task_complete" and action.get("verified"):
+                final_answer = action.get("claim", "").strip()
+                break
         log_queue.put(f"[SYSTEM] Task completed with {len(actions)} actions\n")
+        if final_answer:
+            log_queue.put(f"[ANSWER] {final_answer}\n")
         log_queue.put("[DONE]")
     except Exception as e:
         log_queue.put(f"[ERROR] {str(e)}\n")

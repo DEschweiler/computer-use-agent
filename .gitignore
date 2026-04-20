@@ -36,4 +36,3 @@ logs/
 
 # Frontend build and source files
 frontend/node_modules/
-frontend/src/
