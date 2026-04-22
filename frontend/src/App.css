@@ -402,6 +402,14 @@ body {
   background: #1a1a1a;
 }
 
+.log-line.thought {
+  background: rgba(124, 58, 237, 0.12);
+  border-left: 3px solid #7c3aed;
+  padding-left: 0.5rem;
+  color: #c4b5fd;
+  font-style: italic;
+}
+
 .screenshot-content {
   display: flex;
   align-items: center;

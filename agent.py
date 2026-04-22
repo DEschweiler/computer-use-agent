@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """
-OCR-only computer-use agent.
+OCR-only computer-use agent (refactored).
 
-Captures only the foreground window and runs Tesseract OCR to detect text
-elements. A persistent element registry assigns stable short IDs (e.g. 'e47')
-that survive across parses via fuzzy feature-based matching.
+Operates on foreground-window screenshots + Tesseract OCR, designed for
+generalist navigation of native Windows apps and Citrix-hosted remote apps
+where no structural UI tree is available.
 
-Features:
-  * Foreground-window-only screenshot — background apps are never analysed.
-  * Multi-pass Tesseract OCR with adaptive + grayscale pre-processing.
-  * Persistent element registry with stable IDs across frames.
-  * Sliding-window conversation history: old screenshots are evicted, old
-    OCR blocks are summarized. Massively reduces token usage over long tasks.
-  * OCR-signature-based screen-change detection (robust against cursor blinks
-    and 1-px redraws).
-  * Programmatic completion verification before escalating to an LLM call.
-  * System-role prompt for persistent rules.
-  * DPI-aware capture on Windows.
-  * Retry logic for transient API failures.
+Design notes (differences from the previous version):
+  * Every action tool carries a 'thought' parameter — the model externalizes
+    its reasoning ("what changed, what I'm doing, what I expect") before each
+    action. This replaces machine-generated outcome strings.
+  * The screenshot sent to the LLM is annotated: OCR boxes + stable IDs,
+    plus a crosshair at the last click location. Same image is written to
+    the debug path so the frontend sees what the model sees.
+  * Composite click_and_type action for the common click-then-type pattern.
+  * Progress trail built from the model's own thoughts, pinned at the top
+    of the latest observation. Replaces the old action journal.
+  * Tight context diet: 2 recent full observations; older tool_call/result
+    pairs collapsed to one-line trail entries and removed from the stream.
+  * Thrashing detector over the last 6 trail entries.
+  * Wait-aware stuck counter (model-initiated waits don't tick it).
+  * IoU-based OCR dedup.
+  * Verifier uses explicit task_complete / continue_working; no auto-execute.
+  * DwmGetWindowAttribute for true window bounds (fixes edge-click misses).
 
-All heavy lifting (the LLM itself) happens on the server; everything local
-stays light.
+Public surface preserved for backend/frontend compatibility:
+  * ComputerAgent, AgentConfig, _load_config, interactive, main
+  * agent.run(instruction) -> dict with 'started_at', 'duration_seconds',
+    'actions', 'tokens'
+  * actions_log entries retain 'iteration', 'action', 'args', 'result' keys;
+    task_complete entries retain 'claim', 'verified', 'reason'
+  * Debug screenshot written to $TEMP/agent_screenshot_debug.png each parse
+  * logging.getLogger("agent") is the channel the backend hooks
+  * Log markers [SCREENSHOT_READY], [TASK_RESULT] preserved
 """
 
 from __future__ import annotations
@@ -39,11 +51,11 @@ import sys
 import tempfile
 import time
 import urllib3
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -51,14 +63,13 @@ import pyautogui
 import pytesseract
 import requests
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 # --- Environment setup ----------------------------------------------------- #
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# Tesseract path: env var wins, otherwise use a sensible default on Windows.
 _TESSERACT_CMD = os.getenv("TESSERACT_CMD")
 if _TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
@@ -67,7 +78,6 @@ elif platform.system() == "Windows":
     if _default.exists():
         pytesseract.pytesseract.tesseract_cmd = str(_default)
 
-# OCR language: env var
 OCR_LANG = os.getenv("OCR_LANG", "eng")
 
 logging.basicConfig(
@@ -78,6 +88,20 @@ logging.basicConfig(
 log = logging.getLogger("agent")
 
 # --- Tool schema (OpenAI-compatible function calling) ---------------------- #
+#
+# Every tool takes a 'thought' parameter. It is REQUIRED except where noted —
+# the schema marks it required so small models include it reliably, but the
+# executor never rejects an action for missing thought (we just log "(no
+# thought)"). This gives us structured reasoning without brittle enforcement.
+
+_THOUGHT_PARAM = {
+    "type": "string",
+    "description": (
+        "One short sentence: (a) what changed since your last action and whether "
+        "it matches what you expected, (b) what you are doing now, (c) what you "
+        "expect to happen. Keep it under 40 words."
+    ),
+}
 
 COMPUTER_TOOLS = [
     {
@@ -87,7 +111,7 @@ COMPUTER_TOOLS = [
             "description": (
                 "Click a UI element. Prefer element_id (from the element list) — it resolves "
                 "to exact screen coordinates. Use x/y only when no suitable element_id exists "
-                "(e.g. clicking empty canvas areas or icons not detected by OCR)."
+                "(e.g. clicking an empty edit field whose only nearby element is a label)."
             ),
             "parameters": {
                 "type": "object",
@@ -96,8 +120,9 @@ COMPUTER_TOOLS = [
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                    "thought": _THOUGHT_PARAM,
                 },
-                "required": [],
+                "required": ["thought"],
             },
         },
     },
@@ -112,8 +137,9 @@ COMPUTER_TOOLS = [
                     "element_id": {"type": "string"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
+                    "thought": _THOUGHT_PARAM,
                 },
-                "required": [],
+                "required": ["thought"],
             },
         },
     },
@@ -121,11 +147,39 @@ COMPUTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "type_text",
-            "description": "Type text into the currently focused field. Click the field first.",
+            "description": (
+                "Type text into the currently focused field. Click the field first, or use "
+                "click_and_type to combine both steps."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["text", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click_and_type",
+            "description": (
+                "Click a target and then type text. Use this for the common 'focus a field "
+                "and fill it' pattern — it avoids ordering mistakes between click and type. "
+                "Specify either element_id or x/y; 'text' is what to type."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "element_id": {"type": "string"},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "text": {"type": "string"},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["text", "thought"],
             },
         },
     },
@@ -136,8 +190,11 @@ COMPUTER_TOOLS = [
             "description": "Press one or more keys simultaneously, e.g. ['ctrl','a'] or ['enter'].",
             "parameters": {
                 "type": "object",
-                "properties": {"keys": {"type": "array", "items": {"type": "string"}}},
-                "required": ["keys"],
+                "properties": {
+                    "keys": {"type": "array", "items": {"type": "string"}},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["keys", "thought"],
             },
         },
     },
@@ -152,8 +209,9 @@ COMPUTER_TOOLS = [
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "scroll_y": {"type": "integer"},
+                    "thought": _THOUGHT_PARAM,
                 },
-                "required": ["scroll_y"],
+                "required": ["scroll_y", "thought"],
             },
         },
     },
@@ -161,23 +219,56 @@ COMPUTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "wait",
-            "description": "Wait a short period (e.g. for a dialog to appear). Default 1.5s.",
+            "description": (
+                "Wait a short period (e.g. for a dialog to appear, a slow save to complete). "
+                "Default 1.5s. Use this when you expect the screen to change on its own — "
+                "the stuck-screen detector knows not to count waits against you."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"seconds": {"type": "number"}},
-                "required": [],
+                "properties": {
+                    "seconds": {"type": "number"},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["thought"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "task_complete",
-            "description": "Signal task completion. Only call when ALL steps are verified done.",
+            "name": "finish_task",
+            "description": (
+                "Declare the task finished. You MUST cite evidence: specific text "
+                "currently visible on screen that proves the task succeeded. "
+                "CRITICAL: do NOT cite field labels, form titles, menu items, or "
+                "other UI chrome that was already there before you acted — those "
+                "prove nothing. Cite the OUTCOME of your work: a value you typed "
+                "that now shows in a field, a confirmation/success message, a row "
+                "that now appears in a list, a status label that changed. If you "
+                "cannot find any such outcome text on screen, the task is most "
+                "likely NOT done — do not call finish_task yet."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Short summary for the user of what was done."
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "2-5 short strings, each quoting OUTCOME text literally "
+                            "as it appears on screen. Not labels. Not field names. "
+                            "Things like typed values, confirmation messages, new "
+                            "list rows, changed statuses."
+                        ),
+                    },
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["message", "evidence", "thought"],
             },
         },
     },
@@ -191,8 +282,8 @@ COMPUTER_TOOLS = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {"thought": _THOUGHT_PARAM},
+                "required": ["thought"],
             },
         },
     },
@@ -201,15 +292,16 @@ COMPUTER_TOOLS = [
         "function": {
             "name": "focus_window",
             "description": (
-                "Bring a window to the foreground by title. Uses substring matching "
-                "(case-insensitive). Call list_windows first to see available titles."
+                "Bring a window to the foreground by title (case-insensitive substring "
+                "match). Call list_windows first to see available titles."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "Substring of the window title to match."},
+                    "thought": _THOUGHT_PARAM,
                 },
-                "required": ["title"],
+                "required": ["title", "thought"],
             },
         },
     },
@@ -218,36 +310,85 @@ COMPUTER_TOOLS = [
         "function": {
             "name": "calculate",
             "description": (
-                "Perform integer arithmetic to derive precise pixel coordinates. "
-                "Use this when you need a position that is not directly available as an "
-                "element_id — e.g. the midpoint between two OCR elements, or an offset "
-                "from a known coordinate. Supports addition and subtraction only. "
-                "Returns the integer result so you can feed it into x/y of click/scroll."
+                "Integer addition/subtraction for deriving pixel coordinates (e.g. the "
+                "midpoint between two OCR elements, or an offset from a known coordinate)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "a": {"type": "integer", "description": "First operand (pixel value)."},
-                    "op": {"type": "string", "enum": ["+", "-"], "description": "Operator: '+' or '-'."},
-                    "b": {"type": "integer", "description": "Second operand (pixel value)."},
+                    "a": {"type": "integer"},
+                    "op": {"type": "string", "enum": ["+", "-"]},
+                    "b": {"type": "integer"},
+                    "thought": _THOUGHT_PARAM,
                 },
-                "required": ["a", "op", "b"],
+                "required": ["a", "op", "b", "thought"],
             },
         },
     },
 ]
 
+# Verification-only tools: offered ONLY during completion verification.
+_VERIFICATION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_task",
+            "description": (
+                "Confirm the task is truly done based on the current screen. "
+                "Cite OUTCOME evidence only — text that shows the work succeeded. "
+                "Do NOT cite field labels, form titles, or menu items that were "
+                "already on screen before the actor acted; those prove nothing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "2-5 short strings quoting OUTCOME text: typed values "
+                            "now visible, confirmation messages, new rows, changed "
+                            "statuses. Not labels or field names."
+                        ),
+                    },
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["message", "evidence", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "continue_working",
+            "description": (
+                "Reject the completion claim — the task is not yet done. Give a short reason. "
+                "The main loop will resume with your next observation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["reason", "thought"],
+            },
+        },
+    },
+]
+
+
 # --- DPI awareness --------------------------------------------------------- #
 
 def _enable_dpi_awareness() -> None:
-    """Make the process DPI-aware so GetSystemMetrics returns physical pixels."""
+    """Make the process DPI-aware so coordinates are physical pixels."""
     if platform.system() != "Windows":
         return
     try:
         import ctypes
         try:
-            # Per-monitor DPI aware v2 (Windows 10 1703+)
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v2
         except Exception:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -262,23 +403,22 @@ def _enable_dpi_awareness() -> None:
 @dataclass
 class Element:
     """A single UI element detected by OCR, with a stable ID across parses."""
-    stable_id: str                      # e.g. "e47"
+    stable_id: str
     text: str
-    control_type: str                   # always "Text" for OCR elements
-    source: str                         # always "ocr"
+    control_type: str
+    source: str
     x: int
     y: int
     width: int
     height: int
     center_x: int
     center_y: int
-    confidence: int = 0                 # Tesseract confidence 0-100
+    confidence: int = 0
     automation_id: str = ""
     parent_text: str = ""
     last_seen_frame: int = 0
 
     def as_prompt_line(self) -> str:
-        """One-line representation for the LLM prompt. Short on purpose."""
         text = self.text.replace("\n", " ").strip()
         if len(text) > 60:
             text = text[:57] + "..."
@@ -286,7 +426,7 @@ class Element:
 
 
 class ElementRegistry:
-    """Assigns short stable IDs to elements and re-identifies them across parses."""
+    """Assigns short stable IDs to OCR elements across parses."""
 
     def __init__(self, match_threshold: float = 0.62, evict_after_frames: int = 20):
         self._by_id: Dict[str, Element] = {}
@@ -302,44 +442,27 @@ class ElementRegistry:
 
     @staticmethod
     def _similarity(new: Element, old: Element, screen_w: int, screen_h: int) -> float:
-        # Text — strongest signal. Use ratio; empty strings get a neutral score.
         if new.text and old.text:
             text_sim = difflib.SequenceMatcher(None, new.text.lower(), old.text.lower()).ratio()
         else:
             text_sim = 0.4 if (not new.text and not old.text) else 0.0
-
-        # Control type must match to get credit.
         type_sim = 1.0 if new.control_type == old.control_type else 0.3
-
-        # Source match (all OCR, so always 1.0, kept for stability).
         source_sim = 1.0 if new.source == old.source else 0.5
-
-        # Relative position similarity (robust to window moves of same app).
         dx = abs(new.center_x - old.center_x) / max(1, screen_w)
         dy = abs(new.center_y - old.center_y) / max(1, screen_h)
         pos_sim = max(0.0, 1.0 - 4.0 * (dx + dy))
-
-        # Size similarity.
         dw = abs(new.width - old.width) / max(1, screen_w)
         dh = abs(new.height - old.height) / max(1, screen_h)
         size_sim = max(0.0, 1.0 - 4.0 * (dw + dh))
-
         return (
-            0.45 * text_sim
-            + 0.15 * type_sim
-            + 0.10 * source_sim
-            + 0.20 * pos_sim
-            + 0.10 * size_sim
+            0.45 * text_sim + 0.15 * type_sim + 0.10 * source_sim
+            + 0.20 * pos_sim + 0.10 * size_sim
         )
 
     def reconcile(self, new_elements: List[Element], screen_w: int, screen_h: int) -> List[Element]:
-        """Assign stable IDs to new elements by matching against the registry."""
         self._frame += 1
         unmatched_ids = set(self._by_id.keys())
         result: List[Element] = []
-
-        # Greedy matching: for each new element, find its best candidate.
-        # For large screens this is O(n * m). Screens typically have <300 elements, so fine.
         for elem in new_elements:
             best_id, best_score = None, self._match_threshold
             for rid in unmatched_ids:
@@ -348,9 +471,7 @@ class ElementRegistry:
                 if score > best_score:
                     best_score = score
                     best_id = rid
-
             if best_id is not None:
-                # Reuse: update positional/size info but keep the ID.
                 elem.stable_id = best_id
                 elem.last_seen_frame = self._frame
                 self._by_id[best_id] = elem
@@ -359,70 +480,38 @@ class ElementRegistry:
                 elem.stable_id = self._mint_id()
                 elem.last_seen_frame = self._frame
                 self._by_id[elem.stable_id] = elem
-
             result.append(elem)
-
-        # Evict long-unseen entries so the registry doesn't grow unbounded.
         stale = [rid for rid, el in self._by_id.items()
                  if self._frame - el.last_seen_frame > self._evict_after]
         for rid in stale:
             del self._by_id[rid]
-
         return result
 
     def get(self, stable_id: str) -> Optional[Element]:
         return self._by_id.get(stable_id)
 
-    def resolve_fuzzy(self, text: str) -> Optional[Element]:
-        """Last-resort lookup by text. Used when the model guesses a text name."""
-        text = text.lower().strip()
-        best, best_score = None, 0.6
-        for el in self._by_id.values():
-            if not el.text:
-                continue
-            score = difflib.SequenceMatcher(None, text, el.text.lower()).ratio()
-            if score > best_score:
-                best_score = score
-                best = el
-        return best
-
 
 # --- OCR ------------------------------------------------------------------- #
 
 def _ocr_passes(image: Image.Image, upscale: float) -> List[Tuple[str, np.ndarray, str]]:
-    """
-    Return (name, processed_image, tesseract_config) tuples for multi-pass OCR.
-
-    Each pass catches a different class of text:
-      * adaptive:  text on locally-varying backgrounds (PSM 11, fine block size)
-      * grayscale: antialiased low-contrast text that binarization destroys (PSM 11)
-      * block:     structured text in dialogs/forms/toolbars (PSM 6)
-
-    Upscaling happens once and is shared across all passes.
-    All passes run concurrently in the thread pool, so the extra pass costs no
-    additional wall-clock time as long as a CPU thread is available.
-    """
     img = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     if upscale != 1.0:
         gray = cv2.resize(gray, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
-
-    # Block size 17 (must be odd) isolates individual glyphs
-    # 3x-upscaled UI screenshots where character spacing is tight.
-    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, 10)
-
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, 10
+    )
     psm11 = f"--oem 1 --psm 11 -l {OCR_LANG}"
-    psm6  = f"--oem 1 --psm 6  -l {OCR_LANG}"
+    psm6 = f"--oem 1 --psm 6  -l {OCR_LANG}"
     return [
-        ("adaptive",  adaptive, psm11),
-        ("grayscale", gray,     psm11),
-        ("block",     gray,     psm6),
+        ("adaptive", adaptive, psm11),
+        ("grayscale", gray, psm11),
+        ("block", gray, psm6),
     ]
 
 
 def _run_ocr_pass(name: str, processed: np.ndarray, config: str,
                   upscale: float, min_conf: int) -> List[Dict[str, Any]]:
-    """Run a single Tesseract pass and return grouped lines. Thread-safe."""
     try:
         data = pytesseract.image_to_data(processed, output_type=pytesseract.Output.DICT, config=config)
     except Exception:
@@ -465,11 +554,26 @@ def _run_ocr_pass(name: str, processed: np.ndarray, config: str,
     return result
 
 
+def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Intersection-over-union for two axis-aligned boxes dict('x','y','w','h')."""
+    ax1, ay1 = a["x"], a["y"]
+    ax2, ay2 = ax1 + a["w"], ay1 + a["h"]
+    bx1, by1 = b["x"], b["y"]
+    bx2, by2 = bx1 + b["w"], by1 + b["h"]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
 def extract_ocr_elements(image: Image.Image, upscale: float = 3.0, min_conf: int = 20) -> List[Element]:
-    """Run multiple Tesseract passes in parallel, merge results, return deduped line-level Elements."""
+    """Run multi-pass OCR, merge overlapping detections by IoU (not center distance)."""
     passes = _ocr_passes(image, upscale)
 
-    # Run OCR passes concurrently — Tesseract releases the GIL.
     all_lines: List[Dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(passes)) as pool:
         futures = {
@@ -479,14 +583,14 @@ def extract_ocr_elements(image: Image.Image, upscale: float = 3.0, min_conf: int
         for future in concurrent.futures.as_completed(futures):
             all_lines.extend(future.result())
 
-    # Dedupe across passes: two lines match if their centers are close and text is similar.
-    # Keep the highest-confidence version on overlap.
+    # IoU-based dedup: two detections are duplicates if their boxes overlap
+    # substantially AND their text is similar. Keep highest confidence.
     all_lines.sort(key=lambda l: -l["conf"])
     kept: List[Dict[str, Any]] = []
     for line in all_lines:
         is_dup = False
         for k in kept:
-            if abs(line["cx"] - k["cx"]) > 10 or abs(line["cy"] - k["cy"]) > 10:
+            if _iou(line, k) < 0.5:
                 continue
             if difflib.SequenceMatcher(None, line["text"].lower(), k["text"].lower()).ratio() >= 0.6:
                 is_dup = True
@@ -507,7 +611,6 @@ def extract_ocr_elements(image: Image.Image, upscale: float = 3.0, min_conf: int
 
 
 def ocr_signature(elements: List[Element]) -> frozenset:
-    """Stable signature of the visible text for change detection."""
     return frozenset(
         el.text.strip().lower()
         for el in elements
@@ -515,18 +618,38 @@ def ocr_signature(elements: List[Element]) -> frozenset:
     )
 
 
-# --- Screen capture (foreground window only) -------------------------------- #
+# --- Screen capture (foreground window only) ------------------------------ #
+
+def _true_window_rect_windows(hwnd) -> Optional[Tuple[int, int, int, int]]:
+    """Return (x, y, w, h) using DWM extended frame bounds (excludes drop shadow)."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        dwmapi = ctypes.windll.dwmapi
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        rect = ctypes.wintypes.RECT()
+        hr = dwmapi.DwmGetWindowAttribute(
+            ctypes.wintypes.HWND(hwnd),
+            ctypes.wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+        if hr != 0:
+            return None
+        x, y = rect.left, rect.top
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w > 0 and h > 0:
+            return (x, y, w, h)
+    except Exception as exc:
+        log.debug("DwmGetWindowAttribute failed: %s", exc)
+    return None
+
 
 def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
-    Screenshot only the foreground/active window.
-
-    Returns (image, (win_x, win_y, win_w, win_h)) where win_x/win_y are the
-    window's top-left position in screen coordinates. OCR coordinates derived
-    from the returned image must be offset by (win_x, win_y) to become
-    screen-absolute before clicking.
-
-    Falls back to full-screen capture if the window rect cannot be determined.
+    Screenshot only the foreground window. Returns (image, (x, y, w, h)) where
+    x, y are screen-absolute. OCR coords from the image must be offset by
+    (x, y) to become screen-absolute before clicking.
     """
     if platform.system() == "Windows":
         try:
@@ -534,16 +657,20 @@ def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
             import ctypes.wintypes
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
-            rect = ctypes.wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            x, y = rect.left, rect.top
-            w, h = rect.right - rect.left, rect.bottom - rect.top
+
+            # Prefer DWM extended frame bounds (excludes drop shadow).
+            rect = _true_window_rect_windows(hwnd)
+            if rect is None:
+                r = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+
+            x, y, w, h = rect
             if w > 0 and h > 0:
                 img = pyautogui.screenshot(region=(x, y, w, h))
                 return img, (x, y, w, h)
         except Exception as exc:
             log.warning("Foreground window capture failed (%s); falling back to full screen.", exc)
-        # Full-screen fallback
         import ctypes
         user32 = ctypes.windll.user32
         sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
@@ -568,6 +695,92 @@ def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     return img, (0, 0, w, h)
 
 
+# --- Image annotation ------------------------------------------------------ #
+
+def _get_font(size: int = 11) -> Optional[ImageFont.ImageFont]:
+    """Small truetype font if available, else default bitmap font."""
+    candidates = [
+        "arial.ttf", "Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for c in candidates:
+        try:
+            return ImageFont.truetype(c, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def annotate_screenshot(
+    screenshot: Image.Image,
+    elements: List[Element],
+    win_x: int,
+    win_y: int,
+    click_marker: Optional[Tuple[int, int]] = None,
+    max_label_elements: int = 120,
+) -> Image.Image:
+    """
+    Draw OCR bounding boxes + stable IDs onto the screenshot, and optionally
+    a crosshair at click_marker (screen-absolute coords).
+
+    Returns a new RGB image. Input is not modified.
+    """
+    out = screenshot.convert("RGB").copy()
+    draw = ImageDraw.Draw(out, "RGBA")
+    font = _get_font(11)
+
+    # Sort elements by confidence; label only the top N to avoid visual clutter
+    # on very dense screens. Low-confidence elements still get a faint box.
+    elems_sorted = sorted(elements, key=lambda el: -el.confidence)
+
+    for i, el in enumerate(elems_sorted):
+        ix = el.x - win_x
+        iy = el.y - win_y
+        iw = el.width
+        ih = el.height
+
+        # Faint box for every element; brighter for high-confidence / labeled ones.
+        if i < max_label_elements and el.confidence >= 40:
+            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=(255, 140, 0, 220), width=1)
+            # ID label above the box (or below if near top edge).
+            label = el.stable_id
+            label_y = iy - 12 if iy >= 14 else iy + ih + 1
+            # Text with a thin dark backdrop for legibility on any background.
+            if font is not None:
+                try:
+                    tw = draw.textlength(label, font=font)
+                except Exception:
+                    tw = 8 * len(label)
+                th = 11
+                draw.rectangle(
+                    [ix, label_y, ix + tw + 3, label_y + th + 2],
+                    fill=(0, 0, 0, 180),
+                )
+                draw.text((ix + 2, label_y), label, fill=(255, 200, 80), font=font)
+            else:
+                draw.text((ix + 2, max(0, label_y)), label, fill=(255, 200, 80))
+        else:
+            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=(255, 140, 0, 90), width=1)
+
+    # Crosshair at last-click location.
+    if click_marker is not None:
+        cx, cy = click_marker[0] - win_x, click_marker[1] - win_y
+        r = 10
+        # Cyan circle + crosshair, with dark halo for contrast.
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(0, 0, 0, 220), width=3)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(0, 255, 255, 255), width=2)
+        draw.line([cx - r - 4, cy, cx + r + 4, cy], fill=(0, 255, 255, 255), width=2)
+        draw.line([cx, cy - r - 4, cx, cy + r + 4], fill=(0, 255, 255, 255), width=2)
+        if font is not None:
+            draw.text((cx + r + 6, cy - 6), "last click", fill=(0, 255, 255), font=font)
+
+    return out
+
+
 # --- Action executor ------------------------------------------------------- #
 
 _KEY_MAP = {
@@ -587,22 +800,19 @@ class ActionExecutor:
         self.width = width
         self.height = height
         self.registry = registry
-        # FAILSAFE off; we do our own bounds checking, and letting it raise
-        # mid-task is worse than a clamped click.
+        self.last_click_point: Optional[Tuple[int, int]] = None
+        self.last_click_age: int = 0  # iterations since last click, for marker fade
         pyautogui.FAILSAFE = False
         pyautogui.PAUSE = 0.0
 
     def _resolve_point(self, args: Dict[str, Any]) -> Tuple[Optional[Tuple[int, int]], str]:
-        """Resolve a click target. Returns ((x, y), "") on success or (None, error_msg)."""
         eid = args.get("element_id")
         if eid:
             el = self.registry.get(eid)
             if el is None:
-                log.warning("Unknown element_id: %s — may be stale/evicted", eid)
                 return None, (
-                    f"error: element_id '{eid}' not found (it may have been evicted after "
-                    "a screen change). Use an element_id from the LATEST element list, "
-                    "or fall back to x/y coordinates."
+                    f"error: element_id '{eid}' not found (may have been evicted). "
+                    "Use an id from the LATEST element list or fall back to x/y."
                 )
             return (el.center_x, el.center_y), ""
         x, y = args.get("x"), args.get("y")
@@ -627,14 +837,30 @@ class ActionExecutor:
                     pyautogui.doubleClick(x, y)
                 else:
                     pyautogui.click(x, y, button=button)
+                self.last_click_point = (x, y)
+                self.last_click_age = 0
                 time.sleep(0.4)
-                return f"success: clicked ({x},{y})"
+                return f"clicked ({x},{y})"
 
-            if action_type == "type" or action_type == "type_text":
+            if action_type == "click_and_type":
+                point, err = self._resolve_point(args)
+                if point is None:
+                    return err
+                x, y = self._clamp(*point)
+                text = args.get("text", "")
+                pyautogui.click(x, y)
+                self.last_click_point = (x, y)
+                self.last_click_age = 0
+                time.sleep(0.3)
+                pyautogui.write(text, interval=0.03)
+                time.sleep(0.2)
+                return f"clicked ({x},{y}) and typed {len(text)} chars"
+
+            if action_type in ("type", "type_text"):
                 text = args.get("text", "")
                 pyautogui.write(text, interval=0.03)
                 time.sleep(0.2)
-                return f"success: typed {len(text)} chars"
+                return f"typed {len(text)} chars"
 
             if action_type == "keypress":
                 keys = [_KEY_MAP.get(k.lower(), k.lower()) for k in args.get("keys", [])]
@@ -643,10 +869,10 @@ class ActionExecutor:
                 if len(keys) == 1:
                     pyautogui.press(keys[0])
                 else:
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                     pyautogui.hotkey(*keys)
-                    time.sleep(0.3)
-                return f"success: pressed {'+'.join(keys)}"
+                    time.sleep(0.2)
+                return f"pressed {'+'.join(keys)}"
 
             if action_type == "scroll":
                 x = args.get("x", self.width // 2)
@@ -654,12 +880,12 @@ class ActionExecutor:
                 scroll_y = int(args.get("scroll_y", 0))
                 pyautogui.moveTo(*self._clamp(x, y))
                 pyautogui.scroll(-scroll_y)
-                return f"success: scrolled {scroll_y}"
+                return f"scrolled {scroll_y}"
 
             if action_type == "wait":
                 secs = float(args.get("seconds", 1.5))
                 time.sleep(min(secs, 10.0))
-                return f"success: waited {secs}s"
+                return f"waited {secs}s"
 
             if action_type == "list_windows":
                 return self._list_windows()
@@ -675,28 +901,32 @@ class ActionExecutor:
                 op = args.get("op")
                 b = args.get("b")
                 if a is None or b is None or op not in ("+", "-"):
-                    return "error: calculate requires integer args 'a', 'b' and op '+' or '-'"
+                    return "error: calculate requires a, b, op in ('+', '-')"
                 result = int(a) + int(b) if op == "+" else int(a) - int(b)
                 return f"result: {result}"
 
             return f"error: unknown action {action_type}"
 
         except pyautogui.FailSafeException:
-            return "error: failsafe triggered (mouse at screen corner)"
+            return "error: failsafe triggered"
         except Exception as exc:
             log.exception("Action error")
             return f"error: {exc}"
 
-    # --- Window management helpers (Windows-only, stubs on other OS) ------- #
+    def tick_click_age(self) -> None:
+        """Called once per iteration. After 2 iterations, forget the click marker."""
+        self.last_click_age += 1
+        if self.last_click_age >= 2:
+            self.last_click_point = None
+
+    # --- Window management helpers (Windows) ------------------------------ #
 
     @staticmethod
     def _list_windows() -> str:
-        """Return a newline-separated list of visible window titles."""
         if platform.system() != "Windows":
             return "error: list_windows is only supported on Windows"
         import ctypes
         import ctypes.wintypes
-
         user32 = ctypes.windll.user32
         titles: List[str] = []
 
@@ -717,12 +947,10 @@ class ActionExecutor:
 
     @staticmethod
     def _focus_window(title_substr: str) -> str:
-        """Bring the first window whose title contains *title_substr* to the foreground."""
         if platform.system() != "Windows":
             return "error: focus_window is only supported on Windows"
         import ctypes
         import ctypes.wintypes
-
         user32 = ctypes.windll.user32
         title_lower = title_substr.lower()
         target_hwnd = None
@@ -737,42 +965,256 @@ class ActionExecutor:
                     user32.GetWindowTextW(hwnd, buf, length + 1)
                     if title_lower in buf.value.lower():
                         target_hwnd = hwnd
-                        return False  # stop enumeration
+                        return False
             return True
 
         user32.EnumWindows(enum_cb, 0)
-
         if target_hwnd is None:
             return f"error: no window matching '{title_substr}' found"
-
-        # Restore if minimized, then bring to foreground.
         SW_RESTORE = 9
         if user32.IsIconic(target_hwnd):
             user32.ShowWindow(target_hwnd, SW_RESTORE)
         user32.SetForegroundWindow(target_hwnd)
         time.sleep(0.5)
-
-        # Read actual title for confirmation.
         length = user32.GetWindowTextLengthW(target_hwnd)
         buf = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(target_hwnd, buf, length + 1)
-        return f"success: focused '{buf.value}'"
+        return f"focused '{buf.value}'"
 
 
-# --- Conversation history with sliding window ----------------------------- #
+# --- Progress trail (model-thought-driven) -------------------------------- #
+
+@dataclass
+class TrailEntry:
+    iteration: int
+    action: str
+    target_key: str     # element_id or "x,y" or text snippet — used for thrashing detection
+    thought: str
+    result: str
+    screen_changed: bool
+
+
+class ProgressTrail:
+    """
+    Rolling list of past actions enriched with the model's own thoughts.
+
+    Purpose: give the model long-horizon memory of WHAT it has tried and
+    WHY, without dragging full observations through the prompt. Rendered
+    as a pinned block at the top of every new observation.
+    """
+
+    def __init__(self, max_entries: int = 15):
+        self._entries: Deque[TrailEntry] = deque(maxlen=max_entries)
+
+    def record(self, entry: TrailEntry) -> None:
+        self._entries.append(entry)
+
+    def entries(self) -> List[TrailEntry]:
+        return list(self._entries)
+
+    def render(self) -> str:
+        if not self._entries:
+            return ""
+        lines = ["PROGRESS SO FAR (your recent actions, thoughts, and outcomes):"]
+        for e in self._entries:
+            status = "✓ screen changed" if e.screen_changed else "— no visible change"
+            thought = e.thought.strip() or "(no thought)"
+            # One compact line per entry.
+            lines.append(
+                f"  #{e.iteration} {e.action}({e.target_key}) — {thought} → {e.result}; {status}"
+            )
+        return "\n".join(lines)
+
+    def thrashing_warning(self) -> Optional[str]:
+        """
+        Detect thrashing over the last 6 entries. Thrashing = cycling between
+        ≤3 distinct action targets with no visible screen change.
+        """
+        recent = list(self._entries)[-6:]
+        if len(recent) < 4:
+            return None
+        if any(e.screen_changed for e in recent):
+            return None
+        targets = {e.target_key for e in recent if e.target_key}
+        if 0 < len(targets) <= 3:
+            tlist = ", ".join(sorted(targets))
+            return (
+                f"⚠ THRASHING DETECTED: in the last {len(recent)} steps you have acted "
+                f"on only {{{tlist}}} with NO visible screen change. Stop repeating. "
+                "Consider: (a) wait(2) in case the app is slow, (b) try keyboard Tab "
+                "to reach the target, (c) focus a different window, (d) re-read the "
+                "screen carefully — the target may not be where you think it is."
+            )
+        return None
+
+
+def target_key_from_args(action: str, args: Dict[str, Any]) -> str:
+    """A short, stable string identifying the target of an action — for thrashing detection."""
+    if action in ("click", "double_click", "click_and_type", "scroll"):
+        eid = args.get("element_id")
+        if eid:
+            return eid
+        x, y = args.get("x"), args.get("y")
+        if x is not None and y is not None:
+            # Bucket to 20px cells so near-duplicate clicks are seen as "the same"
+            return f"{int(x) // 20 * 20},{int(y) // 20 * 20}"
+        return ""
+    if action in ("type", "type_text"):
+        t = (args.get("text") or "")[:20]
+        return f'text:"{t}"'
+    if action == "keypress":
+        return "+".join(args.get("keys", []))
+    if action == "focus_window":
+        return (args.get("title") or "")[:20]
+    if action == "wait":
+        return "wait"
+    return ""
+
+
+# --- Evidence check (generic task completion verification) --------------- #
+
+def _extract_meaningful_words(text: str) -> List[str]:
+    """Extract lowercased words of length >=4 OR any token containing digits.
+    These are the tokens we require to be findable in OCR."""
+    tokens = re.findall(r"[A-Za-zÄÖÜäöüß0-9]+", text)
+    out = []
+    for t in tokens:
+        if any(ch.isdigit() for ch in t) or len(t) >= 4:
+            out.append(t.lower())
+    return out
+
+
+def _best_fuzzy_match(word: str, ocr_blob: str) -> Tuple[float, str]:
+    """Find the best fuzzy match for `word` in the OCR blob. Returns (ratio, matched_token)."""
+    best_ratio = 0.0
+    best_tok = ""
+    # Scan words of similar length (±2) for efficiency.
+    for tok in re.findall(r"[A-Za-zÄÖÜäöüß0-9]+", ocr_blob):
+        if abs(len(tok) - len(word)) > 2:
+            continue
+        r = difflib.SequenceMatcher(None, word, tok.lower()).ratio()
+        if r > best_ratio:
+            best_ratio = r
+            best_tok = tok
+    return best_ratio, best_tok
+
+
+def check_evidence_in_ocr(
+    evidence: List[str],
+    elements: List[Element],
+    min_hit_ratio: float = 0.7,
+    fuzzy_threshold: float = 0.82,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    For each evidence string, check whether a sufficient fraction of its
+    meaningful words are present in the current OCR (exact or fuzzy match).
+
+    Returns (all_passed, details) where `details` is a list of per-evidence
+    dicts with keys 'evidence', 'passed', 'missing', 'near_misses'.
+    Near-misses are surfaced so the model can see "you said 'Mustermann' but
+    the screen reads 'Mustermnn' — probably a typing or OCR issue".
+    """
+    ocr_blob = " ".join(el.text for el in elements)
+    ocr_blob_lower = ocr_blob.lower()
+
+    details: List[Dict[str, Any]] = []
+    all_passed = True
+
+    for claim in evidence:
+        claim = (claim or "").strip()
+        if not claim:
+            details.append({"evidence": claim, "passed": False,
+                            "missing": ["(empty evidence string)"], "near_misses": []})
+            all_passed = False
+            continue
+
+        words = _extract_meaningful_words(claim)
+        if not words:
+            # No substantive words to check — be lenient and accept, but note it.
+            details.append({"evidence": claim, "passed": True,
+                            "missing": [], "near_misses": [],
+                            "note": "no checkable tokens"})
+            continue
+
+        missing: List[str] = []
+        near_misses: List[Tuple[str, str, float]] = []  # (word, matched, ratio)
+        for w in words:
+            if w in ocr_blob_lower:
+                continue
+            ratio, tok = _best_fuzzy_match(w, ocr_blob)
+            if ratio >= fuzzy_threshold:
+                near_misses.append((w, tok, ratio))
+                # Near-miss counts as a hit for the ratio, but we record it.
+                continue
+            missing.append(w)
+
+        hit = len(words) - len(missing)
+        passed = (hit / len(words)) >= min_hit_ratio
+        if not passed:
+            all_passed = False
+
+        details.append({
+            "evidence": claim,
+            "passed": passed,
+            "missing": missing,
+            "near_misses": [f"'{w}' ≈ '{t}'" for w, t, _ in near_misses],
+        })
+
+    return all_passed, details
+
+
+def log_evidence_summary(evidence: List[str], details: List[Dict[str, Any]]) -> None:
+    """Short INFO log describing the evidence check outcome."""
+    passed = sum(1 for d in details if d["passed"])
+    log.info("evidence check: %d/%d passed (%d items total)",
+             passed, len(details), len(evidence))
+    for d in details:
+        mark = "✓" if d["passed"] else "✗"
+        extra = ""
+        if d.get("missing"):
+            extra = f"  missing: {', '.join(d['missing'])}"
+        if d.get("near_misses"):
+            extra += f"  near: {'; '.join(d['near_misses'])}"
+        log.info("  %s %r%s", mark, d["evidence"], extra)
+
+
+def format_evidence_rejection(details: List[Dict[str, Any]]) -> str:
+    """Build a message telling the model exactly which evidence items failed."""
+    lines = ["Evidence check FAILED — your cited evidence was not findable in OCR:"]
+    for d in details:
+        if d["passed"]:
+            continue
+        lines.append(f"  • '{d['evidence']}'")
+        if d["missing"]:
+            lines.append(f"      missing words: {', '.join(d['missing'])}")
+        if d["near_misses"]:
+            lines.append(f"      near-misses (typo / OCR garble?): {'; '.join(d['near_misses'])}")
+    lines.append(
+        "Look carefully at the current screen. Either (a) the action did not "
+        "produce what you claimed — keep working — or (b) OCR garbled the text, "
+        "in which case re-cite evidence using what OCR actually shows."
+    )
+    return "\n".join(lines)
+
+
 
 class ConversationHistory:
     """
-    Maintains the message list for the LLM with a sliding window:
-      * The system prompt is pinned.
-      * The initial user task message is pinned.
-      * Recent N exchanges keep their full content (screenshots, OCR blocks).
-      * Older exchanges get their images stripped and OCR replaced by short summaries.
+    Keeps:
+      * System prompt (pinned)
+      * Initial task (pinned, with first screenshot)
+      * The last N observation exchanges WITH their images + full OCR
+      * Older observation messages collapsed to one short line (no image)
+      * Tool_call / tool_result pairs older than the last `keep_tool_turns`
+        turns are removed from the outgoing stream entirely — their content
+        lives on in the ProgressTrail, which is always part of the latest
+        observation.
     """
 
-    def __init__(self, system_prompt: str, keep_recent: int = 3):
+    def __init__(self, system_prompt: str, keep_recent: int = 2, keep_tool_turns: int = 2):
         self._messages: List[dict] = [{"role": "system", "content": system_prompt}]
         self._keep_recent = keep_recent
+        self._keep_tool_turns = keep_tool_turns
         self._pinned_user_idx: Optional[int] = None
 
     def add_initial_user(self, task: str, element_text: str, screenshot_b64: str) -> None:
@@ -791,6 +1233,32 @@ class ConversationHistory:
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
         self._messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
 
+    def ensure_tool_results_for(self, tool_calls: List[dict], placeholder: str = "(no action taken)") -> int:
+        """
+        Enforce the OpenAI message-shape invariant: every assistant tool_call
+        must be followed (before the next assistant message) by a 'tool' role
+        message with a matching tool_call_id. Call this after a tool_calls
+        batch is processed — it appends placeholder responses for any ids
+        that weren't already answered. Returns the number of placeholders added.
+
+        Without this, a break mid-loop or an unrecognized tool name leaves
+        dangling tool_calls which cause 400 Bad Request on the next turn.
+        """
+        existing = {
+            m.get("tool_call_id")
+            for m in self._messages
+            if m.get("role") == "tool"
+        }
+        added = 0
+        for tc in tool_calls:
+            tc_id = tc.get("id")
+            if not tc_id:
+                continue
+            if tc_id not in existing:
+                self.add_tool_result(tc_id, placeholder)
+                added += 1
+        return added
+
     def add_observation(self, element_text: str, screenshot_b64: str, note: str = "") -> None:
         text = (note + "\n\n" if note else "") + f"Updated screen:\n{element_text}"
         self._messages.append({
@@ -802,100 +1270,108 @@ class ConversationHistory:
         })
 
     def add_nudge(self, text: str) -> None:
-        """Append a plain text user message (no screenshot). Used to nudge the model."""
         self._messages.append({"role": "user", "content": text})
 
     def messages_for_api(self) -> List[dict]:
-        """Return a slimmed copy suitable for the API: old screenshots stripped."""
+        """
+        Return a slimmed copy:
+          - Old observation messages: replace image+OCR with a one-line summary
+          - Old assistant tool-call / tool-result pairs: drop entirely
+        We identify 'turns' by assistant tool_calls messages; the last
+        `keep_tool_turns` of those (plus their tool results) are kept,
+        earlier ones are removed.
+        """
         msgs = [dict(m) for m in self._messages]
 
-        # Identify which user observation messages are "recent" (keep full) vs old.
-        # We count from the end: leave the last `keep_recent` vision user messages intact.
+        # Step 1: summarize old observation (vision) messages.
         vision_indices = [
             i for i, m in enumerate(msgs)
             if m.get("role") == "user" and isinstance(m.get("content"), list)
             and any(c.get("type") == "image_url" for c in m["content"])
-            and i != self._pinned_user_idx  # the initial task message is pinned
+            and i != self._pinned_user_idx
         ]
-        keep_set = set(vision_indices[-self._keep_recent:])
-
+        keep_vision = set(vision_indices[-self._keep_recent:])
         for i in vision_indices:
-            if i in keep_set:
+            if i in keep_vision:
                 continue
-            # Strip image; shorten OCR/element dump to a one-line summary.
             content = msgs[i]["content"]
             text_parts = [c["text"] for c in content if c.get("type") == "text"]
             combined = "\n".join(text_parts)
-            summary = self._summarize_old_observation(combined)
-            msgs[i] = {"role": "user", "content": summary}
+            msgs[i] = {"role": "user", "content": self._summarize_old_observation(combined)}
 
-        return msgs
+        # Step 2: drop old tool-call / tool-result pairs.
+        # Find assistant messages with tool_calls; keep the last N, drop earlier
+        # (plus their matching 'tool' role messages by id).
+        assistant_tc_indices = [
+            i for i, m in enumerate(msgs)
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        ]
+        keep_tc = set(assistant_tc_indices[-self._keep_tool_turns:])
+        to_drop: set = set()
+        kept_tc_ids: set = set()
+        for i in assistant_tc_indices:
+            if i not in keep_tc:
+                to_drop.add(i)
+            else:
+                for tc in (msgs[i].get("tool_calls") or []):
+                    kept_tc_ids.add(tc.get("id"))
+
+        # Drop 'tool' messages whose tool_call_id we've dropped.
+        for i, m in enumerate(msgs):
+            if m.get("role") == "tool" and m.get("tool_call_id") not in kept_tc_ids:
+                to_drop.add(i)
+
+        return [m for i, m in enumerate(msgs) if i not in to_drop]
 
     @staticmethod
     def _summarize_old_observation(text: str) -> str:
-        # Pull the first line (task / status note) and count elements.
         lines = [l for l in text.splitlines() if l.strip()]
         element_count = sum(1 for l in lines if l.startswith("[e"))
         header = lines[0][:120] if lines else "(prior observation)"
         return f"[earlier observation — {element_count} elements on screen] {header}"
 
 
-# --- Completion verification ---------------------------------------------- #
-
-_SUCCESS_PATTERNS = [
-    r"\bsuccess(fully)?\b", r"\bsaved?\b", r"\bgespeichert\b", r"\bcreated?\b",
-    r"\berstellt\b", r"\bcomplete[d]?\b", r"\babgeschlossen\b", r"\bok\b",
-]
-_ERROR_PATTERNS = [
-    r"\berror\b", r"\bfehler\b", r"\binvalid\b", r"\brequired\b",
-    r"\bpflichtfeld\b", r"\bungültig\b", r"\bfailed\b", r"\bfehlgeschlagen\b",
-]
-
-
-def quick_completion_check(elements: List[Element], task: str) -> Tuple[bool, str]:
-    """
-    Cheap heuristic completion check. Returns (clear_pass, note).
-      * clear_pass=True → very confident the task looks done; skip LLM verification.
-      * clear_pass=False → either ambiguous or obviously not done; escalate.
-    The returned note is always shown to the LLM verifier for context.
-    """
-    all_text = " ".join(el.text.lower() for el in elements)
-    has_error = any(re.search(p, all_text) for p in _ERROR_PATTERNS)
-    has_success = any(re.search(p, all_text) for p in _SUCCESS_PATTERNS)
-
-    # Look for task-specific keywords (any word >=4 chars from the task that appears on screen).
-    task_words = [w.lower() for w in re.findall(r"[A-Za-zÄÖÜäöüß]{4,}", task)]
-    task_words_present = [w for w in task_words if w in all_text]
-
-    if has_error:
-        return False, f"⚠ Error indicators visible on screen: look for error/Fehler."
-    if has_success and task_words_present:
-        return True, f"✓ Success indicator present and task keywords found: {task_words_present[:5]}"
-    return False, f"No clear success/error signal. Task keywords present on screen: {task_words_present[:5]}"
-
-
 # --- Agent ----------------------------------------------------------------- #
 
 SYSTEM_PROMPT = """\
-You are an expert AI agent controlling a computer to complete tasks through visual \
-observation and automated actions. You receive a screenshot AND a structured list of \
-OCR-detected text elements on every step.
+You are an expert AI agent controlling a computer via OCR + screenshot observation. \
+You receive, every step: (1) an annotated screenshot with orange OCR boxes and stable \
+IDs drawn on interactive text, plus a cyan crosshair marking your last click; \
+(2) a text list of those OCR elements in the form [id] 'text' @(cx,cy) with \
+screen-absolute coordinates; (3) a PROGRESS SO FAR block summarizing what you have \
+done, what you thought, and what changed.
 
-RULES (persistent, always apply):
-- Prefer element_id (like 'e47') over raw x/y coordinates. IDs are stable across steps \
-  while the UI is unchanged, and resolve to exact screen-absolute centers.
-- Element list format: [id] 'text' @(cx,cy) — all coordinates are screen-absolute.
-- For form fields: the label and the input field are separate visual elements. Click in \
-  the input area (near but not on the label) to focus it, then type.
-- After typing, verify the value appears in the next element list before proceeding.
-- If the screen does not change after an action, do NOT repeat the same action. Reassess.
-- Only call task_complete when ALL requested steps are verified done AND a success \
-  indicator is visible AND no error is on screen.
-- To switch between applications, call list_windows to see what is open, then \
-  focus_window with a title substring to bring it to the foreground. The next screenshot \
-  will automatically capture the newly focused window.
-- Never fabricate element IDs. If you are unsure, use coordinates.
-- Work in the language of the UI (German or English as appropriate).
+REASONING PATTERN — for every action, include a 'thought' that covers:
+  1. What changed since my last action, and does it match what I expected?
+  2. What I am doing now.
+  3. What I expect to happen next.
+Keep it under 40 words. This is how you remember your plan and notice mistakes.
+
+RULES:
+- Prefer element_id over raw x/y. Coordinates are screen-absolute.
+- Form fields are often NOT detected by OCR when empty — only the label beside \
+  them is. In that case, click just to the right of the label, or use \
+  click_and_type with x/y to focus-and-fill in one step. Verify by checking \
+  whether your typed text appears in the next element list.
+- If OCR shows text that should have been cleared is still there, your clear \
+  attempt (Ctrl+A, Backspace, Delete) did NOT succeed. Do not just retype — \
+  try a different clear approach or you will append instead of replace.
+- If the screen does not change after an action, do NOT repeat the same action. \
+  Reassess. If thrashing is warned about, change approach entirely.
+- If you expect a delay (save, dialog appearing, data loading), use wait() \
+  explicitly — waits are not counted against the stuck-screen detector.
+- To declare the task done, call finish_task. You MUST cite 2-5 short pieces \
+  of evidence: specific text currently visible on screen that proves the task \
+  succeeded. Quote the text literally as it appears. \
+  CRITICAL: field labels, form titles, menu items, and other UI chrome that \
+  was already on screen before you acted do NOT count as evidence — they prove \
+  nothing. Cite the OUTCOME of your work: a value you typed that now shows in \
+  a field, a confirmation/success message, a new row in a list, a changed \
+  status. If you cannot find such outcome text on the screen, the task is \
+  most likely not done — keep working instead of calling finish_task. \
+  Your evidence is checked against OCR; bogus evidence is rejected and you \
+  must keep working.
+- Work in the UI's language (German or English).
 """
 
 
@@ -905,7 +1381,8 @@ class AgentConfig:
     api_key: str
     model: str
     max_iterations: int = 40
-    keep_recent_exchanges: int = 3
+    keep_recent_exchanges: int = 2
+    keep_tool_turns: int = 2
     temperature: float = 0.1
     max_tokens: int = 1024
     request_timeout: int = 120
@@ -933,11 +1410,15 @@ class ComputerAgent:
         self.executor = ActionExecutor(self.width, self.height, self.registry)
         self._last_ocr_signature: Optional[frozenset] = None
         self._no_change_streak = 0
+        self._last_action_was_wait = False
 
     # --- screen parsing --------------------------------------------------- #
 
     def _parse_screen(self) -> Tuple[str, List[Element]]:
-        """Capture foreground window, run OCR, reconcile IDs. Returns (b64 png, elements)."""
+        """
+        Capture foreground window, run OCR, reconcile IDs, ANNOTATE the image
+        (boxes + IDs + crosshair at last-click), return (base64 of annotated image, elements).
+        """
         t0 = time.monotonic()
         screenshot, (win_x, win_y, win_w, win_h) = capture_foreground()
         log.info("screenshot: %.2fs (window %dx%d at %d,%d)",
@@ -948,50 +1429,43 @@ class ComputerAgent:
         ocr_elements = extract_ocr_elements(screenshot, self.cfg.ocr_upscale, self.cfg.ocr_min_conf)
         log.info("OCR: %.2fs → %d lines", time.monotonic() - t1, len(ocr_elements))
 
-        # Offset OCR coordinates from window-relative to screen-absolute so that
-        # click/scroll actions (which use screen coordinates) work correctly.
+        # Offset OCR coords from window-relative to screen-absolute.
         for el in ocr_elements:
             el.x += win_x
             el.y += win_y
             el.center_x += win_x
             el.center_y += win_y
 
-        log.info("OCR: %d lines | parse total: %.2fs", len(ocr_elements), time.monotonic() - t0)
-
         reconciled = self.registry.reconcile(ocr_elements, self.width, self.height)
 
-        if self.cfg.save_debug_screenshots:
-            self._save_debug(screenshot, reconciled, win_x, win_y)
+        # Annotate — same image for LLM and for the debug screenshot file.
+        annotated = annotate_screenshot(
+            screenshot, reconciled, win_x, win_y,
+            click_marker=self.executor.last_click_point,
+        )
 
-        # Base64-encode the screenshot.
+        if self.cfg.save_debug_screenshots:
+            self._save_debug(annotated)
+
         buf = BytesIO()
-        screenshot.save(buf, format="PNG")
+        annotated.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
 
         return b64, reconciled
 
-    def _save_debug(
-        self, screenshot: Image.Image, elements: List[Element], win_x: int = 0, win_y: int = 0
-    ) -> None:
+    def _save_debug(self, annotated: Image.Image) -> None:
+        """Write the SAME annotated image to the shared debug path."""
         try:
-            annotated = screenshot.copy()
-            draw = ImageDraw.Draw(annotated)
-            for el in elements:
-                # Convert screen-absolute coordinates back to image-relative for drawing.
-                ix, iy = el.x - win_x, el.y - win_y
-                draw.rectangle([ix, iy, ix + el.width, iy + el.height], outline=(255, 140, 0), width=1)
-                draw.text((ix, max(0, iy - 10)), el.stable_id, fill=(255, 140, 0))
             out = Path(os.environ.get("TEMP", tempfile.gettempdir())) / "agent_screenshot_debug.png"
             annotated.save(out, format="PNG")
             log.info("[SCREENSHOT_READY]")
         except Exception as exc:
-            log.debug("debug screenshot failed: %s", exc)
+            log.debug("debug screenshot save failed: %s", exc)
 
     @staticmethod
     def _format_elements(elements: List[Element], limit: int = 200) -> str:
         if not elements:
             return "(no elements detected)"
-        # Sort top-to-bottom, left-to-right for readability.
         elements_sorted = sorted(elements, key=lambda el: (el.center_y // 16, el.center_x))
         lines = [el.as_prompt_line() for el in elements_sorted[:limit]]
         suffix = f"\n... (+{len(elements) - limit} more, not shown)" if len(elements) > limit else ""
@@ -999,11 +1473,11 @@ class ComputerAgent:
 
     # --- API call --------------------------------------------------------- #
 
-    def _call_llm(self, messages: List[dict]) -> dict:
+    def _call_llm(self, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
         payload = {
             "model": self.cfg.model,
             "messages": messages,
-            "tools": COMPUTER_TOOLS,
+            "tools": tools if tools is not None else COMPUTER_TOOLS,
             "tool_choice": "auto",
             "max_tokens": self.cfg.max_tokens,
             "temperature": self.cfg.temperature,
@@ -1012,15 +1486,12 @@ class ComputerAgent:
             "Authorization": f"Bearer {self.cfg.api_key}",
             "Content-Type": "application/json",
         }
-
         last_exc: Optional[Exception] = None
         for attempt in range(1 + self.cfg.request_retries):
             try:
                 resp = requests.post(
-                    self.cfg.endpoint,
-                    headers=headers, json=payload,
-                    verify=self.cfg.verify_tls,
-                    timeout=self.cfg.request_timeout,
+                    self.cfg.endpoint, headers=headers, json=payload,
+                    verify=self.cfg.verify_tls, timeout=self.cfg.request_timeout,
                 )
                 resp.raise_for_status()
                 return resp.json()
@@ -1040,24 +1511,28 @@ class ComputerAgent:
         log.info("TASK: %s", instruction)
         log.info("=" * 70)
 
-        # Reset per-task state so sequential tasks don't leak stale data.
+        # Reset per-task state.
         self._no_change_streak = 0
         self._last_ocr_signature = None
+        self._last_action_was_wait = False
         self.registry = ElementRegistry()
-        self.executor.registry = self.registry
+        self.executor = ActionExecutor(self.width, self.height, self.registry)
 
         screenshot_b64, elements = self._parse_screen()
         elements_text = self._format_elements(elements)
         self._last_ocr_signature = ocr_signature(elements)
 
-        history = ConversationHistory(SYSTEM_PROMPT, keep_recent=self.cfg.keep_recent_exchanges)
+        history = ConversationHistory(
+            SYSTEM_PROMPT,
+            keep_recent=self.cfg.keep_recent_exchanges,
+            keep_tool_turns=self.cfg.keep_tool_turns,
+        )
         history.add_initial_user(instruction, elements_text, screenshot_b64)
 
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
+        trail = ProgressTrail(max_entries=15)
         nudge_count = 0
-        last_action_sig: Optional[str] = None
-        repeat_streak = 0
 
         for iteration in range(self.cfg.max_iterations):
             log.info("--- iteration %d ---", iteration + 1)
@@ -1078,57 +1553,86 @@ class ComputerAgent:
 
             choice = response["choices"][0]
             msg = choice["message"]
-            finish = choice.get("finish_reason", "")
             history.add_assistant(msg)
-
             tool_calls = msg.get("tool_calls") or []
 
             if not tool_calls:
-                # Model emitted text. Nudge it toward actions.
-                text = msg.get("content", "") or ""
-                log.info("Model text: %s", text[:200])
+                text = (msg.get("content") or "").strip()
+                log.info("Model text (no tool call): %s", text[:200])
                 if any(p in text.lower() for p in ("task is complete", "task complete", "done")):
-                    log.info("✓ Model indicates completion in text.")
-                    break
-                if finish != "stop":
-                    log.warning("Unexpected finish_reason: %s", finish)
+                    log.info("Model indicates completion in text — stopping.")
                     break
                 nudge_count += 1
                 if nudge_count >= 2:
-                    # After repeated nudges, re-parse the screen to give fresh context.
-                    log.info("Re-parsing screen after %d consecutive text-only responses.", nudge_count)
+                    log.info("Re-parsing screen after repeated text-only responses.")
                     screenshot_b64, elements = self._parse_screen()
-                    history.add_observation(
-                        self._format_elements(elements), screenshot_b64,
-                        note="Screen re-captured after repeated text-only responses. Please issue a tool call.",
-                    )
+                    note = trail.render()
+                    note = (note + "\n\n" if note else "") + \
+                           "Please issue a tool call to make progress. Include a 'thought'."
+                    history.add_observation(self._format_elements(elements), screenshot_b64, note=note)
                     nudge_count = 0
                 else:
-                    log.info("No tool call returned; sending text nudge.")
-                    history.add_nudge("Please issue a tool call to make progress. "
-                                      "The screen has not changed.")
+                    history.add_nudge("Please issue a tool call with a 'thought' to make progress.")
                 continue
 
-            nudge_count = 0  # reset nudge counter when we get tool calls
+            nudge_count = 0
             task_done = False
+            iteration_actions: List[Tuple[str, Dict[str, Any], str]] = []  # (fn_name, args, result)
+
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 try:
                     args = json.loads(tc["function"]["arguments"] or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                log.info("→ %s(%s)", fn_name, args)
+                thought = (args.get("thought") or "").strip()
+                log.info("→ %s(%s)", fn_name, {k: v for k, v in args.items() if k != "thought"})
+                if thought:
+                    log.info("[THOUGHT] %s", thought)
 
-                if fn_name == "task_complete":
+                if fn_name in ("finish_task", "task_complete"):
                     claim = args.get("message", "")
-                    verified, reason, corrective = self._verify_completion(
-                        instruction, claim, history, tokens)
+                    evidence = args.get("evidence") or []
+                    if not isinstance(evidence, list):
+                        evidence = [str(evidence)]
+
+                    # Cheap check first: does the model's own evidence appear in the current OCR?
+                    evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
+                    log_evidence_summary(evidence, ev_details)
+
+                    if not evidence_ok:
+                        rejection = format_evidence_rejection(ev_details)
+                        history.add_tool_result(tc["id"], rejection)
+                        actions_log.append({
+                            "iteration": iteration + 1,
+                            "action": "task_complete",
+                            "claim": claim,
+                            "evidence": evidence,
+                            "evidence_check": ev_details,
+                            "verified": False,
+                            "reason": "evidence not found in current OCR",
+                            "thought": thought,
+                        })
+                        # Do NOT break — the model should keep working. The rejection
+                        # is now in its context and the trail will record this attempt.
+                        iteration_actions.append((fn_name, args, "evidence check failed"))
+                        continue
+
+                    # Evidence cleared the cheap check. Escalate to LLM verification.
+                    verified, reason = self._verify_completion(
+                        instruction, claim, evidence, history, tokens, trail
+                    )
                     history.add_tool_result(tc["id"], f"verification: {reason}")
                     actions_log.append({
-                        "iteration": iteration + 1, "action": "task_complete",
-                        "claim": claim, "verified": verified, "reason": reason,
+                        "iteration": iteration + 1,
+                        "action": "task_complete",
+                        "claim": claim,
+                        "evidence": evidence,
+                        "evidence_check": ev_details,
+                        "verified": verified,
+                        "reason": reason,
+                        "thought": thought,
                     })
-                    actions_log.extend(corrective)
                     if verified:
                         if claim.strip():
                             log.info("[TASK_RESULT] %s", claim.strip())
@@ -1136,56 +1640,81 @@ class ComputerAgent:
                     break
 
                 action_type = "type" if fn_name == "type_text" else fn_name
-                result = self.executor.execute(action_type, args)
+                # Strip 'thought' before handing args to the executor.
+                exec_args = {k: v for k, v in args.items() if k != "thought"}
+                result = self.executor.execute(action_type, exec_args)
                 log.info("   %s", result)
                 history.add_tool_result(tc["id"], result)
                 actions_log.append({
-                    "iteration": iteration + 1, "action": fn_name,
-                    "args": args, "result": result,
+                    "iteration": iteration + 1,
+                    "action": fn_name,
+                    "args": args,
+                    "result": result,
+                    "thought": thought,
                 })
+                iteration_actions.append((fn_name, args, result))
+
+            # Enforce the assistant.tool_calls <-> tool.tool_call_id invariant:
+            # any tool_calls we broke out of (e.g. after finish_task) or didn't
+            # recognize must still have a placeholder tool response or the next
+            # API call will 400.
+            dangling = history.ensure_tool_results_for(tool_calls)
+            if dangling:
+                log.debug("Added %d placeholder tool results for unprocessed calls", dangling)
 
             if task_done:
                 break
 
-            # Build a fingerprint of this iteration's tool calls for repeat detection.
-            action_sig = "|".join(
-                f"{tc['function']['name']}:{tc['function'].get('arguments','')}"
-                for tc in tool_calls
-            )
-            if action_sig and action_sig == last_action_sig:
-                repeat_streak += 1
-            else:
-                repeat_streak = 0
-            last_action_sig = action_sig or last_action_sig
-
-            # Observe the new screen state.
-            time.sleep(0.8)
+            # Observe new screen state.
+            time.sleep(0.6)
+            self.executor.tick_click_age()
             screenshot_b64, elements = self._parse_screen()
             new_sig = ocr_signature(elements)
-            if new_sig == self._last_ocr_signature:
-                self._no_change_streak += 1
-            else:
-                self._no_change_streak = 0
+            screen_changed = new_sig != self._last_ocr_signature
             self._last_ocr_signature = new_sig
 
-            note = ""
-            if self._no_change_streak >= 1:
-                note = f"⚠ Screen unchanged for {self._no_change_streak} iteration(s) — try a different action."
+            # Wait-aware stuck counter: don't count iterations where the model's
+            # ONLY action was wait(). Any non-wait action ticks the counter.
+            had_non_wait_action = any(a != "wait" for a, _, _ in iteration_actions)
+            if screen_changed:
+                self._no_change_streak = 0
+            elif had_non_wait_action:
+                self._no_change_streak += 1
+            # (else: only waits this turn, don't tick)
+
+            # Record one trail entry per action in this iteration.
+            for fn_name, args, result in iteration_actions:
+                thought = (args.get("thought") or "").strip()
+                trail.record(TrailEntry(
+                    iteration=iteration + 1,
+                    action=fn_name,
+                    target_key=target_key_from_args(fn_name, args),
+                    thought=thought,
+                    result=result,
+                    screen_changed=screen_changed,
+                ))
+
+            # Build the next observation note: trail + thrashing/stuck warnings.
+            note_parts: List[str] = [trail.render()]
+            thrash = trail.thrashing_warning()
+            if thrash:
+                log.warning(thrash)
+                note_parts.append(thrash)
             if self._no_change_streak >= 3:
-                note += " Consider an entirely different approach."
                 log.warning("Screen stuck for %d iterations", self._no_change_streak)
-            if repeat_streak >= 1:
-                note += f" You have repeated the same action(s) {repeat_streak + 1} time(s) in a row."
+                note_parts.append(
+                    "⚠ Screen unchanged for multiple iterations — try an entirely "
+                    "different approach (different target, keyboard navigation, or wait)."
+                )
             if self._no_change_streak >= 5:
                 log.error("Screen unchanged for %d consecutive iterations — aborting.",
                           self._no_change_streak)
-                actions_log.append({"iteration": iteration + 1,
-                                    "error": "aborted: screen stuck"})
+                actions_log.append({"iteration": iteration + 1, "error": "aborted: screen stuck"})
                 break
 
+            note = "\n\n".join(p for p in note_parts if p)
             history.add_observation(self._format_elements(elements), screenshot_b64, note=note)
 
-        # --- summary ---
         duration = time.time() - start
         log.info("=" * 70)
         log.info("DONE in %dm%.1fs | actions=%d | api_calls=%d | tokens in/out/total=%d/%d/%d",
@@ -1204,35 +1733,57 @@ class ComputerAgent:
     # --- completion verification ----------------------------------------- #
 
     def _verify_completion(
-        self, task: str, claim: str,
-        history: ConversationHistory, tokens: Dict[str, int],
-    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        self,
+        task: str,
+        claim: str,
+        evidence: List[str],
+        history: ConversationHistory,
+        tokens: Dict[str, int],
+        trail: ProgressTrail,
+    ) -> Tuple[bool, str]:
+        """
+        Re-screenshot, re-check evidence against the FRESH OCR (things may
+        have changed in the ~0.6s since the actor's claim), and if it still
+        holds, ask the model with a restricted tool set (finish_task |
+        continue_working). The verifier must itself cite evidence, which is
+        also checked against OCR before acceptance. No auto-execution of
+        corrective actions.
+        """
         log.info("Verifying completion: %s", claim)
-        time.sleep(0.8)
+        time.sleep(0.6)
+        self.executor.tick_click_age()
         screenshot_b64, elements = self._parse_screen()
 
-        quick_ok, note = quick_completion_check(elements, task)
-        if quick_ok:
-            log.info("✓ Quick check passed: %s", note)
-            return True, f"accepted by quick check ({note})", []
+        # Re-check actor's evidence against the fresh OCR.
+        evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
+        log.info("verifier re-check of actor's evidence:")
+        log_evidence_summary(evidence, ev_details)
+        if not evidence_ok:
+            rejection = format_evidence_rejection(ev_details)
+            # Push into history so the actor sees the rejection on its next turn.
+            history.add_observation(
+                self._format_elements(elements), screenshot_b64,
+                note=trail.render() + "\n\n" + rejection if trail.entries() else rejection,
+            )
+            return False, "evidence disappeared on re-check of fresh screen"
 
-        # Escalate to the model — but make it clear we want a yes/no judgment.
-        log.info("Escalating to LLM verification: %s", note)
         elements_text = self._format_elements(elements)
-        history.add_observation(
-            elements_text, screenshot_b64,
-            note=(
-                f"VERIFICATION REQUEST: You claimed the task is complete ('{claim}'). "
-                f"Programmatic check says: {note}. "
-                "Critically assess the screen. If truly done, call task_complete again with a "
-                "precise confirmation. Otherwise, continue with more actions."
-            ),
+        note_parts = [trail.render()] if trail.entries() else []
+        note_parts.append(
+            f"VERIFICATION REQUEST: the actor claimed the task is done ('{claim}') "
+            f"and cited evidence:\n  - " + "\n  - ".join(f"'{e}'" for e in evidence) +
+            f"\nTask was: '{task}'. Look carefully at the current screen. "
+            "If truly done, call finish_task with YOUR OWN evidence (text you see "
+            "on the current screen). Otherwise call continue_working with a short "
+            "reason."
         )
+        history.add_observation(elements_text, screenshot_b64, note="\n\n".join(note_parts))
+
         try:
-            response = self._call_llm(history.messages_for_api())
+            response = self._call_llm(history.messages_for_api(), tools=_VERIFICATION_TOOLS)
         except Exception as exc:
             log.warning("Verification call failed: %s. NOT accepting claim.", exc)
-            return False, f"api failure during verification — not accepting: {exc}", []
+            return False, f"api failure during verification — not accepting: {exc}"
 
         tokens["calls"] += 1
         if "usage" in response:
@@ -1244,26 +1795,45 @@ class ComputerAgent:
         vmsg = response["choices"][0]["message"]
         history.add_assistant(vmsg)
         vtcs = vmsg.get("tool_calls") or []
-        if vtcs and vtcs[0]["function"]["name"] == "task_complete":
-            history.add_tool_result(vtcs[0]["id"], "verified complete")
-            return True, "model confirmed after seeing current screen", []
-
-        # Model wants to continue: execute its first action so we don't lose progress.
-        corrective_actions: List[Dict[str, Any]] = []
-        for tc in vtcs:
-            fn_name = tc["function"]["name"]
+        decision: Optional[Tuple[bool, str]] = None
+        if vtcs:
+            tc = vtcs[0]
+            fn = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
                 args = {}
-            action_type = "type" if fn_name == "type_text" else fn_name
-            result = self.executor.execute(action_type, args)
-            history.add_tool_result(tc["id"], result)
-            corrective_actions.append({
-                "action": fn_name, "args": args, "result": result,
-                "source": "verification_corrective",
-            })
-        return False, "model chose to continue", corrective_actions
+            if fn in ("finish_task", "task_complete"):
+                # Verifier must also ground its answer in visible evidence.
+                v_evidence = args.get("evidence") or []
+                if not isinstance(v_evidence, list):
+                    v_evidence = [str(v_evidence)]
+                v_ok, v_details = check_evidence_in_ocr(v_evidence, elements)
+                log.info("verifier's own evidence check:")
+                log_evidence_summary(v_evidence, v_details)
+                if not v_ok:
+                    history.add_tool_result(tc["id"], format_evidence_rejection(v_details))
+                    decision = (False, "verifier cited evidence not findable in OCR")
+                else:
+                    history.add_tool_result(tc["id"], "verified complete")
+                    decision = (True, "model confirmed after seeing current screen")
+            elif fn == "continue_working":
+                reason = args.get("reason", "no reason given")
+                history.add_tool_result(tc["id"], f"noted: {reason}")
+                decision = (False, f"model rejected claim: {reason}")
+            else:
+                # Unknown tool — close the id with a placeholder.
+                history.add_tool_result(tc["id"], f"ignored: unknown tool '{fn}' during verification")
+                decision = (False, f"verifier called unknown tool: {fn}")
+
+        if decision is None:
+            # Model emitted text or no tool calls at all.
+            text = (vmsg.get("content") or "").strip()[:200]
+            decision = (False, f"verifier did not call a recognized tool (said: {text!r})")
+
+        # Safety net: ensure every verifier tool_call has a matching tool response.
+        history.ensure_tool_results_for(vtcs, placeholder="(verifier response ignored)")
+        return decision
 
 
 # --- Entry point ----------------------------------------------------------- #

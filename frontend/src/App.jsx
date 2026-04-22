@@ -257,7 +257,10 @@ function App() {
                 ) : (
                   <pre className="debug-logs">
                     {debugLogs.map((log, idx) => (
-                      <div key={idx} className="log-line">{log}</div>
+                      <div
+                        key={idx}
+                        className={`log-line${log.includes('[THOUGHT]') ? ' thought' : ''}`}
+                      >{log}</div>
                     ))}
                     <div ref={logsEndRef} />
                   </pre>
