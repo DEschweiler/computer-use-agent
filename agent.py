@@ -1051,7 +1051,11 @@ class ProgressTrail:
 
 def target_key_from_args(action: str, args: Dict[str, Any]) -> str:
     """A short, stable string identifying the target of an action — for thrashing detection."""
-    if action in ("click", "double_click", "click_and_type", "scroll"):
+    if action == "scroll":
+        clicks = args.get("scroll_clicks", 0)
+        direction = "up" if clicks > 0 else "down"
+        return f"scroll({direction},{abs(clicks)})"
+    if action in ("click", "double_click", "click_and_type"):
         eid = args.get("element_id")
         if eid:
             return eid
@@ -1221,10 +1225,7 @@ class ConversationHistory:
     def add_initial_user(self, task: str, element_text: str, screenshot_b64: str) -> None:
         self._messages.append({
             "role": "user",
-            "content": [
-                {"type": "text", "text": f"TASK: {task}\n\nCurrent screen state:\n{element_text}"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
-            ],
+            "content": f"TASK: {task}",
         })
         self._pinned_user_idx = len(self._messages) - 1
 
@@ -1306,7 +1307,7 @@ class ConversationHistory:
             i for i, m in enumerate(msgs)
             if m.get("role") == "assistant" and m.get("tool_calls")
         ]
-        keep_tc = set(assistant_tc_indices[-self._keep_tool_turns:])
+        keep_tc = set() if self._keep_tool_turns == 0 else set(assistant_tc_indices[-self._keep_tool_turns:])
         kept_tc_ids: set = set()
         for i in assistant_tc_indices:
             if i not in keep_tc:
@@ -1380,8 +1381,8 @@ class AgentConfig:
     api_key: str
     model: str
     max_iterations: int = 40
-    keep_recent_exchanges: int = 2
-    keep_tool_turns: int = 2
+    keep_recent_exchanges: int = 1
+    keep_tool_turns: int = 0
     temperature: float = 0.1
     max_tokens: int = 1024
     request_timeout: int = 120
@@ -1472,7 +1473,48 @@ class ComputerAgent:
 
     # --- API call --------------------------------------------------------- #
 
+    _CONTEXT_DUMP_PATH = Path(tempfile.gettempdir()) / "agent_context_dump.txt"
+
+    def _dump_context(self, messages: List[dict]) -> None:
+        """Write the current LLM message list to a human-readable file, overwriting each call.
+        Images are replaced with a short placeholder to keep the file readable."""
+        try:
+            lines: List[str] = []
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "?").upper()
+                content = msg.get("content", "")
+                tool_calls = msg.get("tool_calls")
+                tool_call_id = msg.get("tool_call_id")
+
+                lines.append(f"{'='*70}")
+                header = f"[{i}] {role}"
+                if tool_call_id:
+                    header += f" (tool_call_id={tool_call_id})"
+                lines.append(header)
+                lines.append(f"{'='*70}")
+
+                if isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "text":
+                            lines.append(part["text"])
+                        elif part.get("type") == "image_url":
+                            lines.append("[IMAGE]")
+                elif isinstance(content, str) and content:
+                    lines.append(content)
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        lines.append(f"  TOOL_CALL: {fn.get('name')}  args={fn.get('arguments')}")
+
+                lines.append("")
+
+            self._CONTEXT_DUMP_PATH.write_text("\n".join(lines), encoding="utf-8")
+        except Exception:
+            pass  # never let debug output break the agent
+
     def _call_llm(self, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+        self._dump_context(messages)
         payload = {
             "model": self.cfg.model,
             "messages": messages,
@@ -1577,6 +1619,7 @@ class ComputerAgent:
             nudge_count = 0
             task_done = False
             iteration_actions: List[Tuple[str, Dict[str, Any], str]] = []  # (fn_name, args, result)
+            pre_action_elements = {el.stable_id: el for el in elements}  # capture before actions change the screen
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -1682,11 +1725,10 @@ class ComputerAgent:
             # (else: only waits this turn, don't tick)
 
             # Record one trail entry per action in this iteration.
-            element_by_id = {el.stable_id: el for el in elements}
             for fn_name, args, result in iteration_actions:
                 thought = (args.get("thought") or "").strip()
                 eid = args.get("element_id", "")
-                el = element_by_id.get(eid)
+                el = pre_action_elements.get(eid)
                 target_label = el.text.strip() if el else ""
                 trail.record(TrailEntry(
                     iteration=iteration + 1,
