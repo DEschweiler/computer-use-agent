@@ -202,16 +202,16 @@ COMPUTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "scroll",
-            "description": "Scroll at a position. scroll_y > 0 scrolls down; < 0 scrolls up.",
+            "description": "Scroll the mouse wheel at a position. Use x/y to place the cursor before scrolling (defaults to screen center). scroll_clicks: positive = scroll UP (toward top of page), negative = scroll DOWN (toward bottom). Use 200–1000 for a normal scroll, 100–3000 to jump a large section.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
-                    "scroll_y": {"type": "integer"},
+                    "scroll_clicks": {"type": "integer", "description": "Wheel clicks to scroll. Positive = up, negative = down. Typical range: 200-1000; use 100-3000 for a large jump."},
                     "thought": _THOUGHT_PARAM,
                 },
-                "required": ["scroll_y", "thought"],
+                "required": ["scroll_clicks", "thought"],
             },
         },
     },
@@ -877,10 +877,10 @@ class ActionExecutor:
             if action_type == "scroll":
                 x = args.get("x", self.width // 2)
                 y = args.get("y", self.height // 2)
-                scroll_y = int(args.get("scroll_y", 0))
+                scroll_clicks = int(args.get("scroll_clicks", args.get("scroll_y", 0)))
                 pyautogui.moveTo(*self._clamp(x, y))
-                pyautogui.scroll(-scroll_y)
-                return f"scrolled {scroll_y}"
+                pyautogui.scroll(scroll_clicks)  # pyautogui: positive=up, negative=down
+                return f"scrolled {scroll_clicks} clicks ({'up' if scroll_clicks > 0 else 'down'})"
 
             if action_type == "wait":
                 secs = float(args.get("seconds", 1.5))
@@ -992,18 +992,19 @@ class TrailEntry:
     thought: str
     result: str
     screen_changed: bool
+    target_label: str = ""  # human-readable label of the element interacted with
 
 
 class ProgressTrail:
     """
-    Rolling list of past actions enriched with the model's own thoughts.
+    Full history of all actions enriched with the model's own thoughts.
 
-    Purpose: give the model long-horizon memory of WHAT it has tried and
+    Purpose: give the model complete memory of WHAT it has tried and
     WHY, without dragging full observations through the prompt. Rendered
     as a pinned block at the top of every new observation.
     """
 
-    def __init__(self, max_entries: int = 15):
+    def __init__(self, max_entries: Optional[int] = None):
         self._entries: Deque[TrailEntry] = deque(maxlen=max_entries)
 
     def record(self, entry: TrailEntry) -> None:
@@ -1015,13 +1016,13 @@ class ProgressTrail:
     def render(self) -> str:
         if not self._entries:
             return ""
-        lines = ["PROGRESS SO FAR (your recent actions, thoughts, and outcomes):"]
+        lines = ["PROGRESS SO FAR (all actions, thoughts, and outcomes — do NOT repeat failed approaches):"]
         for e in self._entries:
             status = "✓ screen changed" if e.screen_changed else "— no visible change"
             thought = e.thought.strip() or "(no thought)"
-            # One compact line per entry.
+            target = f"{e.target_key}('{e.target_label}')" if e.target_label else e.target_key
             lines.append(
-                f"  #{e.iteration} {e.action}({e.target_key}) — {thought} → {e.result}; {status}"
+                f"  #{e.iteration} {e.action}({target}) — {thought} → {e.result}; {status}"
             )
         return "\n".join(lines)
 
@@ -1275,15 +1276,18 @@ class ConversationHistory:
     def messages_for_api(self) -> List[dict]:
         """
         Return a slimmed copy:
-          - Old observation messages: replace image+OCR with a one-line summary
-          - Old assistant tool-call / tool-result pairs: drop entirely
+          - Old observation messages: dropped entirely (history lives in the ProgressTrail
+            which is prepended to every new observation, so old OCR dumps and screenshots
+            add no value)
+          - Old assistant tool-call / tool-result pairs: dropped entirely
         We identify 'turns' by assistant tool_calls messages; the last
         `keep_tool_turns` of those (plus their tool results) are kept,
         earlier ones are removed.
         """
         msgs = [dict(m) for m in self._messages]
+        to_drop: set = set()
 
-        # Step 1: summarize old observation (vision) messages.
+        # Step 1: drop old observation (vision) messages entirely.
         vision_indices = [
             i for i, m in enumerate(msgs)
             if m.get("role") == "user" and isinstance(m.get("content"), list)
@@ -1292,12 +1296,8 @@ class ConversationHistory:
         ]
         keep_vision = set(vision_indices[-self._keep_recent:])
         for i in vision_indices:
-            if i in keep_vision:
-                continue
-            content = msgs[i]["content"]
-            text_parts = [c["text"] for c in content if c.get("type") == "text"]
-            combined = "\n".join(text_parts)
-            msgs[i] = {"role": "user", "content": self._summarize_old_observation(combined)}
+            if i not in keep_vision:
+                to_drop.add(i)
 
         # Step 2: drop old tool-call / tool-result pairs.
         # Find assistant messages with tool_calls; keep the last N, drop earlier
@@ -1307,7 +1307,6 @@ class ConversationHistory:
             if m.get("role") == "assistant" and m.get("tool_calls")
         ]
         keep_tc = set(assistant_tc_indices[-self._keep_tool_turns:])
-        to_drop: set = set()
         kept_tc_ids: set = set()
         for i in assistant_tc_indices:
             if i not in keep_tc:
@@ -1531,7 +1530,7 @@ class ComputerAgent:
 
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
-        trail = ProgressTrail(max_entries=15)
+        trail = ProgressTrail()
         nudge_count = 0
 
         for iteration in range(self.cfg.max_iterations):
@@ -1683,8 +1682,12 @@ class ComputerAgent:
             # (else: only waits this turn, don't tick)
 
             # Record one trail entry per action in this iteration.
+            element_by_id = {el.stable_id: el for el in elements}
             for fn_name, args, result in iteration_actions:
                 thought = (args.get("thought") or "").strip()
+                eid = args.get("element_id", "")
+                el = element_by_id.get(eid)
+                target_label = el.text.strip() if el else ""
                 trail.record(TrailEntry(
                     iteration=iteration + 1,
                     action=fn_name,
@@ -1692,6 +1695,7 @@ class ComputerAgent:
                     thought=thought,
                     result=result,
                     screen_changed=screen_changed,
+                    target_label=target_label,
                 ))
 
             # Build the next observation note: trail + thrashing/stuck warnings.
