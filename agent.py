@@ -2,7 +2,7 @@
 """
 OCR-only computer-use agent (refactored).
 
-Operates on foreground-window screenshots + Tesseract OCR, designed for
+Operates on foreground-window screenshots + RapidOCR, designed for
 generalist navigation of native Windows apps and Citrix-hosted remote apps
 where no structural UI tree is available.
 
@@ -20,7 +20,7 @@ Design notes (differences from the previous version):
     pairs collapsed to one-line trail entries and removed from the stream.
   * Thrashing detector over the last 6 trail entries.
   * Wait-aware stuck counter (model-initiated waits don't tick it).
-  * IoU-based OCR dedup.
+  * IoU-based OCR dedup (RapidOCR rarely overlaps, kept as safety net).
   * Verifier uses explicit task_complete / continue_working; no auto-execute.
   * DwmGetWindowAttribute for true window bounds (fixes edge-click misses).
 
@@ -38,7 +38,6 @@ Public surface preserved for backend/frontend compatibility:
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import datetime
 import difflib
 import json
@@ -51,34 +50,39 @@ import sys
 import tempfile
 import time
 import urllib3
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 import pyautogui
-import pytesseract
 import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
+from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
 # --- Environment setup ----------------------------------------------------- #
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-_TESSERACT_CMD = os.getenv("TESSERACT_CMD")
-if _TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
-elif platform.system() == "Windows":
-    _default = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe"
-    if _default.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(_default)
+# RapidOCR engine — created on first use so import-time cost is zero.
+_rapidocr_engine: Optional[RapidOCR] = None
 
-OCR_LANG = os.getenv("OCR_LANG", "eng")
+
+def _get_rapidocr_engine() -> RapidOCR:
+    global _rapidocr_engine
+    if _rapidocr_engine is None:
+        _rapidocr_engine = RapidOCR(params={
+            "Rec.lang_type": LangRec.LATIN,
+            "Rec.model_type": ModelType.MOBILE,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+            "Det.model_type": ModelType.MOBILE,
+            "Global.log_level": "error",
+        })
+    return _rapidocr_engine
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -515,65 +519,31 @@ class ElementRegistry:
 
 # --- OCR ------------------------------------------------------------------- #
 
-def _ocr_passes(image: Image.Image, upscale: float) -> List[Tuple[str, np.ndarray, str]]:
-    img = np.array(image.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    if upscale != 1.0:
-        gray = cv2.resize(gray, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
-    adaptive = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, 10
-    )
-    psm11 = f"--oem 1 --psm 11 -l {OCR_LANG}"
-    psm6 = f"--oem 1 --psm 6  -l {OCR_LANG}"
-    return [
-        ("adaptive", adaptive, psm11),
-        ("grayscale", gray, psm11),
-        ("block", gray, psm6),
-    ]
+def _rapidocr_to_boxes(result, min_score: float = 0.8) -> List[Dict[str, Any]]:
+    """Convert a RapidOCR result (polygon-based) to axis-aligned box dicts.
 
-
-def _run_ocr_pass(name: str, processed: np.ndarray, config: str,
-                  upscale: float, min_conf: int) -> List[Dict[str, Any]]:
-    try:
-        data = pytesseract.image_to_data(processed, output_type=pytesseract.Output.DICT, config=config)
-    except Exception:
-        log.exception("OCR pass %s failed", name)
+    Only detections with a recognition confidence *score* > *min_score* are
+    returned.
+    """
+    if result.boxes is None:
         return []
-
-    lines: Dict[tuple, list] = defaultdict(list)
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        try:
-            conf = int(float(data["conf"][i]))
-        except (ValueError, TypeError):
+    boxes: List[Dict[str, Any]] = []
+    for poly, text, score in zip(result.boxes, result.txts, result.scores):
+        if score <= min_score:
             continue
-        if conf < min_conf or not text:
-            continue
-        lines[(data["block_num"][i], data["line_num"][i])].append({
-            "text": text, "conf": conf,
-            "x": int(data["left"][i] / upscale),
-            "y": int(data["top"][i] / upscale),
-            "w": int(data["width"][i] / upscale),
-            "h": int(data["height"][i] / upscale),
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        x, y = int(min(xs)), int(min(ys))
+        x2, y2 = int(max(xs)), int(max(ys))
+        boxes.append({
+            "text": text,
+            "conf": int(score * 100),
+            "x": x, "y": y,
+            "w": x2 - x, "h": y2 - y,
+            "cx": (x + x2) // 2,
+            "cy": (y + y2) // 2,
         })
-
-    result: List[Dict[str, Any]] = []
-    for words in lines.values():
-        if not words:
-            continue
-        words.sort(key=lambda w: w["x"])
-        text = " ".join(w["text"] for w in words)
-        x = min(w["x"] for w in words)
-        y = min(w["y"] for w in words)
-        x2 = max(w["x"] + w["w"] for w in words)
-        y2 = max(w["y"] + w["h"] for w in words)
-        avg_conf = sum(w["conf"] for w in words) // len(words)
-        result.append({
-            "text": text, "conf": avg_conf,
-            "x": x, "y": y, "w": x2 - x, "h": y2 - y,
-            "cx": (x + x2) // 2, "cy": (y + y2) // 2,
-        })
-    return result
+    return boxes
 
 
 def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -592,43 +562,40 @@ def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def extract_ocr_elements(image: Image.Image, upscale: float = 3.0, min_conf: int = 20) -> List[Element]:
-    """Run multi-pass OCR, merge overlapping detections by IoU (not center distance)."""
-    passes = _ocr_passes(image, upscale)
+def extract_ocr_elements(image: Image.Image) -> List[Element]:
+    """Run RapidOCR on *image* and return a de-duplicated Element list."""
+    engine = _get_rapidocr_engine()
+    try:
+        result = engine(np.array(image.convert("RGB")))
+    except Exception:
+        log.exception("RapidOCR failed")
+        return []
 
-    all_lines: List[Dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(passes)) as pool:
-        futures = {
-            pool.submit(_run_ocr_pass, name, processed, config, upscale, min_conf): name
-            for name, processed, config in passes
-        }
-        for future in concurrent.futures.as_completed(futures):
-            all_lines.extend(future.result())
+    all_boxes = _rapidocr_to_boxes(result)
 
-    # IoU-based dedup: two detections are duplicates if their boxes overlap
-    # substantially AND their text is similar. Keep highest confidence.
-    all_lines.sort(key=lambda l: -l["conf"])
+    # IoU-based dedup (safety net — RapidOCR rarely produces overlapping boxes).
+    all_boxes.sort(key=lambda b: -b["conf"])
     kept: List[Dict[str, Any]] = []
-    for line in all_lines:
+    for box in all_boxes:
         is_dup = False
         for k in kept:
-            if _iou(line, k) < 0.5:
+            if _iou(box, k) < 0.5:
                 continue
-            if difflib.SequenceMatcher(None, line["text"].lower(), k["text"].lower()).ratio() >= 0.6:
+            if difflib.SequenceMatcher(None, box["text"].lower(), k["text"].lower()).ratio() >= 0.6:
                 is_dup = True
                 break
         if not is_dup:
-            kept.append(line)
+            kept.append(box)
 
     return [
         Element(
             stable_id="",
-            text=l["text"], control_type="Text", source="ocr",
-            x=l["x"], y=l["y"], width=l["w"], height=l["h"],
-            center_x=l["cx"], center_y=l["cy"],
-            confidence=l["conf"],
+            text=b["text"], control_type="Text", source="ocr",
+            x=b["x"], y=b["y"], width=b["w"], height=b["h"],
+            center_x=b["cx"], center_y=b["cy"],
+            confidence=b["conf"],
         )
-        for l in kept
+        for b in kept
     ]
 
 
@@ -1477,8 +1444,8 @@ class ComputerAgent:
                  time.monotonic() - t0, win_w, win_h, win_x, win_y)
 
         t1 = time.monotonic()
-        log.info("Starting OCR (upscale=%.1fx, 2 passes parallel) ...", self.cfg.ocr_upscale)
-        ocr_elements = extract_ocr_elements(screenshot, self.cfg.ocr_upscale, self.cfg.ocr_min_conf)
+        log.info("Starting OCR (RapidOCR) ...")
+        ocr_elements = extract_ocr_elements(screenshot)
         log.info("OCR: %.2fs → %d lines", time.monotonic() - t1, len(ocr_elements))
 
         # Offset OCR coords from window-relative to screen-absolute.
