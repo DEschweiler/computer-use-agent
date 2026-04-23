@@ -38,6 +38,7 @@ Public surface preserved for backend/frontend compatibility:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime
 import difflib
 import json
@@ -83,6 +84,152 @@ def _get_rapidocr_engine() -> RapidOCR:
             "Global.log_level": "error",
         })
     return _rapidocr_engine
+
+
+# YOLO icon-detector engine (OmniParser v2) — lazy-loaded on first use. -----
+# First call: checks models/icon_detect.onnx (put there by download_models.py);
+# if absent, falls back to downloading + exporting from HuggingFace Hub.
+
+_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1920"))
+_YOLO_CONF_THRESH = float(os.getenv("YOLO_CONF_THRESH", "0.05"))
+_YOLO_IOU_THRESH = float(os.getenv("YOLO_IOU_THRESH", "0.3"))
+# Fraction of a YOLO box's area that must be covered by an OCR box to suppress it.
+# Intentionally low (5 %) so even a small text label inside a large icon box
+# causes the YOLO box to be dropped — avoiding redundant blue overlays.
+_YOLO_OCR_OVERLAP_THRESH = float(os.getenv("YOLO_OCR_OVERLAP_THRESH", "0.05"))
+
+# Local model directory — download_models.py writes here.
+_MODELS_DIR = Path(__file__).parent / "models"
+_LOCAL_ONNX = _MODELS_DIR / "icon_detect.onnx"
+
+_yolo_session: Any = None       # onnxruntime.InferenceSession | None | _YOLO_FAILED
+_yolo_input_name: str = "images"
+_YOLO_FAILED = object()         # sentinel: init attempted and failed — do not retry
+
+# Pillow 9.1+ uses Image.Resampling; Pillow <9.1 used Image.BILINEAR directly.
+_BILINEAR = getattr(getattr(Image, "Resampling", None), "BILINEAR", None) or Image.BILINEAR
+
+
+def _get_yolo_session():
+    """Return a cached ORT InferenceSession for the YOLO icon detector.
+
+    Resolution order:
+    1. models/icon_detect.onnx (put there by download_models.py) — preferred.
+    2. ONNX next to the HF-cached .pt (exported on first run if missing).
+    Returns None if setup failed (will not retry).
+    """
+    global _yolo_session, _yolo_input_name
+    if _yolo_session is _YOLO_FAILED:
+        return None
+    if _yolo_session is not None:
+        return _yolo_session
+    _log = logging.getLogger("agent")
+    try:
+        import onnxruntime as ort
+
+        def _load_session(onnx_path: Path) -> "ort.InferenceSession":
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = 4
+            so.inter_op_num_threads = 1
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            return ort.InferenceSession(
+                str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"]
+            )
+
+        def _export_from_hub() -> Path:
+            from huggingface_hub import hf_hub_download
+            pt_path = hf_hub_download(
+                repo_id="microsoft/OmniParser-v2.0",
+                filename="icon_detect/model.pt",
+            )
+            onnx_path = Path(pt_path).with_suffix(".onnx")
+            if not onnx_path.exists():
+                _log.info("Exporting YOLO icon detector to ONNX (one-time) ...")
+                from ultralytics import YOLO as _YOLO
+                exported = _YOLO(pt_path).export(
+                    format="onnx", imgsz=_YOLO_IMGSZ, simplify=True, dynamic=True
+                )
+                onnx_path = Path(exported)
+                _log.info("ONNX export complete: %s", onnx_path)
+            return onnx_path
+
+        # 1. Prefer local models/ directory.
+        if _LOCAL_ONNX.exists():
+            onnx_path = _LOCAL_ONNX
+            _log.info("Loading local ONNX: %s", onnx_path)
+        else:
+            _log.info(
+                "models/icon_detect.onnx not found — falling back to HF Hub download."
+                " Run download_models.py once to avoid this."
+            )
+            onnx_path = _export_from_hub()
+
+        try:
+            sess = _load_session(onnx_path)
+        except Exception as load_err:
+            # Possibly a corrupted ONNX — delete and re-export from Hub.
+            _log.warning("ORT failed to load %s (%s); re-exporting ...", onnx_path.name, load_err)
+            onnx_path.unlink(missing_ok=True)
+            onnx_path = _export_from_hub()
+            sess = _load_session(onnx_path)
+
+        _yolo_input_name = sess.get_inputs()[0].name
+        _yolo_session = sess
+        _log.info(
+            "YOLO icon detector ready (imgsz=%d, input=%r): %s",
+            _YOLO_IMGSZ, _yolo_input_name, onnx_path.name,
+        )
+    except Exception as exc:
+        _log.error(
+            "YOLO icon detector init failed (%s: %s) — icon detection disabled.",
+            type(exc).__name__, exc, exc_info=True,
+        )
+        _yolo_session = _YOLO_FAILED
+    return _yolo_session if _yolo_session is not _YOLO_FAILED else None
+
+
+def _letterbox(
+    image: "Image.Image", size: int
+) -> "Tuple[np.ndarray, float, int, int]":
+    """Resize *image* to a (size x size) square with grey letterbox padding.
+
+    Returns (inp, scale, pad_top, pad_left) where *inp* is a float32 ndarray
+    of shape (1, 3, size, size) ready for ORT inference.
+    """
+    w, h = image.size
+    scale = size / max(h, w)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = image.resize((nw, nh), _BILINEAR)
+    canvas = Image.new("RGB", (size, size), (114, 114, 114))
+    pad_left = (size - nw) // 2
+    pad_top = (size - nh) // 2
+    canvas.paste(resized, (pad_left, pad_top))
+    arr = np.array(canvas, dtype=np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)[np.newaxis]   # (1, 3, H, W)
+    return arr, scale, pad_top, pad_left
+
+
+def _nms(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
+    """Greedy IoU-based NMS. Returns indices of boxes to keep (highest score first)."""
+    order = scores.argsort()[::-1]
+    kept: List[int] = []
+    while order.size > 0:
+        i = int(order[0])
+        kept.append(i)
+        if order.size == 1:
+            break
+        xx1 = np.maximum(boxes_xyxy[i, 0], boxes_xyxy[order[1:], 0])
+        yy1 = np.maximum(boxes_xyxy[i, 1], boxes_xyxy[order[1:], 1])
+        xx2 = np.minimum(boxes_xyxy[i, 2], boxes_xyxy[order[1:], 2])
+        yy2 = np.minimum(boxes_xyxy[i, 3], boxes_xyxy[order[1:], 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        area_i = (boxes_xyxy[i, 2] - boxes_xyxy[i, 0]) * (boxes_xyxy[i, 3] - boxes_xyxy[i, 1])
+        area_j = ((boxes_xyxy[order[1:], 2] - boxes_xyxy[order[1:], 0])
+                  * (boxes_xyxy[order[1:], 3] - boxes_xyxy[order[1:], 1]))
+        iou = inter / (area_i + area_j - inter + 1e-6)
+        order = order[1:][iou <= iou_thresh]
+    return kept
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -445,6 +592,11 @@ class Element:
     last_seen_frame: int = 0
 
     def as_prompt_line(self) -> str:
+        if self.source == "yolo":
+            return (
+                f"[{self.stable_id}] <interactive> @({self.center_x},{self.center_y})"
+                f" {self.width}x{self.height}px"
+            )
         text = self.text.replace("\n", " ").strip()
         if len(text) > 60:
             text = text[:57] + "..."
@@ -562,6 +714,22 @@ def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _coverage(yolo: Dict[str, Any], ocr: Dict[str, Any]) -> float:
+    """Fraction of the *ocr* box's area that is covered by the *yolo* box.
+
+    Using the OCR box as reference catches large YOLO boxes (e.g. an edit
+    field) that contain a small text label inside them: the OCR box is almost
+    entirely overlapped even though the YOLO box itself is much bigger.
+    """
+    ix1 = max(yolo["x"], ocr["x"])
+    iy1 = max(yolo["y"], ocr["y"])
+    ix2 = min(yolo["x"] + yolo["w"], ocr["x"] + ocr["w"])
+    iy2 = min(yolo["y"] + yolo["h"], ocr["y"] + ocr["h"])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    ocr_area = ocr["w"] * ocr["h"]
+    return inter / ocr_area if ocr_area > 0 else 0.0
+
+
 def extract_ocr_elements(image: Image.Image) -> List[Element]:
     """Run RapidOCR on *image* and return a de-duplicated Element list."""
     engine = _get_rapidocr_engine()
@@ -605,6 +773,59 @@ def ocr_signature(elements: List[Element]) -> frozenset:
         for el in elements
         if len(el.text.strip()) >= 2
     )
+
+
+def extract_icon_elements(image: "Image.Image") -> List[Element]:
+    """Run the OmniParser YOLO icon detector on *image*.
+
+    Returns a list of Elements with source="yolo" and empty text, representing
+    visually detected interactive regions (buttons, icons, empty fields).
+    Only boxes that survive NMS and meet the confidence threshold are returned;
+    overlapping with OCR boxes is handled by the caller.
+    """
+    session = _get_yolo_session()
+    if session is None:
+        return []
+    try:
+        inp, scale, pad_top, pad_left = _letterbox(image.convert("RGB"), _YOLO_IMGSZ)
+        raw = session.run(None, {_yolo_input_name: inp})[0]  # (1, 5, N) or (1, N, 5)
+        preds = raw[0]  # (5, N) or (N, 5)
+        if preds.shape[0] < preds.shape[1]:  # (5, N) → transpose to (N, 5)
+            preds = preds.T
+        # columns: cx, cy, w, h, conf  (single-class model)
+        scores = preds[:, 4]
+        mask = scores > _YOLO_CONF_THRESH
+        preds, scores = preds[mask], scores[mask]
+        if len(preds) == 0:
+            return []
+        # Convert from IMGSZ space to original image pixel coords
+        cx, cy, bw, bh = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
+        x1 = (cx - bw / 2 - pad_left) / scale
+        y1 = (cy - bh / 2 - pad_top) / scale
+        x2 = (cx + bw / 2 - pad_left) / scale
+        y2 = (cy + bh / 2 - pad_top) / scale
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+        keep = _nms(boxes_xyxy, scores, _YOLO_IOU_THRESH)
+        W, H = image.size
+        elements: List[Element] = []
+        for idx in keep:
+            xi1 = max(0, int(boxes_xyxy[idx, 0]))
+            yi1 = max(0, int(boxes_xyxy[idx, 1]))
+            xi2 = min(W, int(boxes_xyxy[idx, 2]))
+            yi2 = min(H, int(boxes_xyxy[idx, 3]))
+            if xi2 <= xi1 or yi2 <= yi1:
+                continue
+            elements.append(Element(
+                stable_id="",
+                text="", control_type="Icon", source="yolo",
+                x=xi1, y=yi1, width=xi2 - xi1, height=yi2 - yi1,
+                center_x=(xi1 + xi2) // 2, center_y=(yi1 + yi2) // 2,
+                confidence=int(scores[idx] * 100),
+            ))
+        return elements
+    except Exception as exc:
+        log.error("YOLO icon detection failed: %s: %s", type(exc).__name__, exc)
+        return []
 
 
 # --- Screen capture (foreground window only) ------------------------------ #
@@ -733,8 +954,16 @@ def annotate_screenshot(
         ih = el.height
 
         # Faint box for every element; brighter for high-confidence / labeled ones.
-        if i < max_label_elements and el.confidence >= 40:
-            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=(255, 140, 0, 220), width=1)
+        # OCR elements: orange. YOLO icon elements: blue.
+        is_yolo = el.source == "yolo"
+        color_full = (50, 150, 255, 220) if is_yolo else (255, 140, 0, 220)
+        color_faint = (50, 150, 255, 90) if is_yolo else (255, 140, 0, 90)
+        label_color = (130, 210, 255) if is_yolo else (255, 200, 80)
+        # Always label YOLO elements (they're few and high-value); OCR elements
+        # need confidence >= 40 to earn a label (avoids cluttering low-conf noise).
+        show_label = i < max_label_elements and (is_yolo or el.confidence >= 40)
+        if show_label:
+            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=color_full, width=1)
             # ID label above the box (or below if near top edge).
             label = el.stable_id
             label_y = iy - 12 if iy >= 14 else iy + ih + 1
@@ -749,11 +978,11 @@ def annotate_screenshot(
                     [ix, label_y, ix + tw + 3, label_y + th + 2],
                     fill=(0, 0, 0, 180),
                 )
-                draw.text((ix + 2, label_y), label, fill=(255, 200, 80), font=font)
+                draw.text((ix + 2, label_y), label, fill=label_color, font=font)
             else:
-                draw.text((ix + 2, max(0, label_y)), label, fill=(255, 200, 80))
+                draw.text((ix + 2, max(0, label_y)), label, fill=label_color)
         else:
-            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=(255, 140, 0, 90), width=1)
+            draw.rectangle([ix, iy, ix + iw, iy + ih], outline=color_faint, width=1)
 
     # Crosshair at last-click location.
     if click_marker is not None:
@@ -1342,10 +1571,13 @@ class ConversationHistory:
 SYSTEM_PROMPT = """\
 You are an expert AI agent controlling a computer via OCR + screenshot observation. \
 You receive, every step: (1) a PROGRESS SO FAR block summarizing what you have \
-done, what you thought, and what changed; (2) a text list of OCR elements \
-in the form [id] 'text' @(cx,cy) with screen-absolute coordinates; (3) an \
-annotated screenshot with orange OCR boxes showing the listed elements and stable \
-IDs drawn on interactive text, plus a cyan crosshair marking your last click.
+done, what you thought, and what changed; (2) two element lists — \
+"OCR TEXT ELEMENTS" in the form [id] 'text' @(cx,cy), and \
+"INTERACTIVE REGIONS" in the form [id] <interactive> @(cx,cy) WxH (visually detected \
+buttons, icons, and empty input fields that OCR cannot see); all coordinates are \
+screen-absolute; (3) an annotated screenshot with orange boxes for OCR elements \
+and blue boxes for interactive regions, both labeled with stable IDs, plus a cyan \
+crosshair marking your last click.
 
 BEFORE EVERY ACTION — read the PROGRESS SO FAR block carefully. For each \
 listed step, ask: Did that action succeed? Did the result build toward the \
@@ -1362,9 +1594,12 @@ Keep it under 40 words. This is how you remember your plan and notice mistakes.
 RULES:
 - Prefer element_id over raw x/y. Coordinates are screen-absolute.
 - Form fields are often NOT detected by OCR when empty — only the label beside \
-  them is. In that case, click just to the right of the label, or use \
-  click_and_type with x/y to focus-and-fill in one step. Verify by checking \
-  whether your typed text appears in the next element list.
+  them is. An empty field may appear as an INTERACTIVE REGION (blue box, <interactive>); \
+  click it by element_id if present. Otherwise click just to the right of the \
+  label, or use click_and_type with x/y to focus-and-fill in one step. Verify by \
+  checking whether your typed text appears in the next OCR TEXT ELEMENTS list.
+- INTERACTIVE REGIONS (<interactive>) have no text — use their element_id to click them. \
+  They represent buttons, icons, and empty fields the OCR cannot read.
 - If OCR shows text that should have been cleared is still there, your clear \
   attempt (Ctrl+A, Backspace, Delete) did NOT succeed. Do not just retype — \
   try a different clear approach or you will append instead of replace. \
@@ -1425,6 +1660,13 @@ class ComputerAgent:
             self.width, self.height = pyautogui.size()
         log.info("Primary monitor: %dx%d", self.width, self.height)
 
+        # Pre-warm both engines at startup (single-threaded) so the first
+        # _parse_screen call pays zero init cost and parallel inference is safe.
+        log.info("Initializing OCR engine ...")
+        _get_rapidocr_engine()
+        log.info("Initializing YOLO icon detector ...")
+        _get_yolo_session()
+
         self.registry = ElementRegistry()
         self.executor = ActionExecutor(self.width, self.height, self.registry)
         self._last_ocr_signature: Optional[frozenset] = None
@@ -1444,18 +1686,43 @@ class ComputerAgent:
                  time.monotonic() - t0, win_w, win_h, win_x, win_y)
 
         t1 = time.monotonic()
-        log.info("Starting OCR (RapidOCR) ...")
-        ocr_elements = extract_ocr_elements(screenshot)
-        log.info("OCR: %.2fs → %d lines", time.monotonic() - t1, len(ocr_elements))
+        log.info("Starting OCR + icon detection (parallel) ...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            ocr_future = pool.submit(extract_ocr_elements, screenshot)
+            icon_future = pool.submit(extract_icon_elements, screenshot)
+            ocr_elements = ocr_future.result()
+            icon_elements = icon_future.result()
+        log.info(
+            "OCR+YOLO: %.2fs \u2192 %d text / %d icon elements",
+            time.monotonic() - t1, len(ocr_elements), len(icon_elements),
+        )
 
-        # Offset OCR coords from window-relative to screen-absolute.
+        # Offset coords from window-relative to screen-absolute.
         for el in ocr_elements:
-            el.x += win_x
-            el.y += win_y
-            el.center_x += win_x
-            el.center_y += win_y
+            el.x += win_x; el.y += win_y
+            el.center_x += win_x; el.center_y += win_y
+        for el in icon_elements:
+            el.x += win_x; el.y += win_y
+            el.center_x += win_x; el.center_y += win_y
 
-        reconciled = self.registry.reconcile(ocr_elements, self.width, self.height)
+        # Merge: keep all OCR elements; add YOLO icon elements that don't
+        # overlap any OCR box by more than YOLO_OCR_OVERLAP_THRESH of the
+        # YOLO box's own area. Using coverage (intersection/YOLO-area) rather
+        # than IoU catches the common case where a small text label sits inside
+        # a larger icon box — IoU would be tiny, but the boxes visually overlap.
+        ocr_boxes = [
+            {"x": el.x, "y": el.y, "w": el.width, "h": el.height}
+            for el in ocr_elements
+        ]
+        merged: List[Element] = list(ocr_elements)
+        for icon_el in icon_elements:
+            icon_box = {"x": icon_el.x, "y": icon_el.y,
+                        "w": icon_el.width, "h": icon_el.height}
+            if any(_coverage(icon_box, ob) >= _YOLO_OCR_OVERLAP_THRESH for ob in ocr_boxes):
+                continue  # overlaps an OCR box — skip
+            merged.append(icon_el)
+
+        reconciled = self.registry.reconcile(merged, self.width, self.height)
 
         # Annotate — same image for LLM and for the debug screenshot file.
         annotated = annotate_screenshot(
@@ -1483,12 +1750,34 @@ class ComputerAgent:
 
     @staticmethod
     def _format_elements(elements: List[Element], limit: int = 200) -> str:
-        if not elements:
-            return "(no elements detected)"
-        elements_sorted = sorted(elements, key=lambda el: (el.center_y // 16, el.center_x))
-        lines = [el.as_prompt_line() for el in elements_sorted[:limit]]
-        suffix = f"\n... (+{len(elements) - limit} more, not shown)" if len(elements) > limit else ""
-        return "\n".join(lines) + suffix
+        """Format elements into two labeled sections: OCR text and YOLO icons."""
+        ocr_els = sorted(
+            [el for el in elements if el.source != "yolo"],
+            key=lambda el: (el.center_y // 16, el.center_x),
+        )
+        yolo_els = sorted(
+            [el for el in elements if el.source == "yolo"],
+            key=lambda el: (el.center_y // 16, el.center_x),
+        )
+        parts: List[str] = []
+
+        ocr_lines = [el.as_prompt_line() for el in ocr_els[:limit]]
+        if len(ocr_els) > limit:
+            ocr_lines.append(f"... (+{len(ocr_els) - limit} more, not shown)")
+        parts.append(
+            "OCR TEXT ELEMENTS:\n" + ("\n".join(ocr_lines) if ocr_lines else "(none)")
+        )
+
+        if yolo_els:
+            yolo_limit = 100
+            yolo_lines = [el.as_prompt_line() for el in yolo_els[:yolo_limit]]
+            if len(yolo_els) > yolo_limit:
+                yolo_lines.append(f"... (+{len(yolo_els) - yolo_limit} more, not shown)")
+            parts.append(
+                "INTERACTIVE REGIONS (icon detector):\n" + "\n".join(yolo_lines)
+            )
+
+        return "\n\n".join(parts) if parts else "(no elements detected)"
 
     # --- API call --------------------------------------------------------- #
 
