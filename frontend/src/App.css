@@ -410,6 +410,13 @@ body {
   font-style: italic;
 }
 
+.log-line.tool-call {
+  background: rgba(6, 182, 212, 0.08);
+  border-left: 3px solid #0891b2;
+  padding-left: 0.5rem;
+  color: #67e8f9;
+}
+
 .screenshot-content {
   display: flex;
   align-items: center;

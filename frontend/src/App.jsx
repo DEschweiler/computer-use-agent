@@ -259,7 +259,7 @@ function App() {
                     {debugLogs.map((log, idx) => (
                       <div
                         key={idx}
-                        className={`log-line${log.includes('[THOUGHT]') ? ' thought' : ''}`}
+                        className={`log-line${log.includes('[THOUGHT]') ? ' thought' : ''}${log.includes('[TOOL]') ? ' tool-call' : ''}`}
                       >{log}</div>
                     ))}
                     <div ref={logsEndRef} />

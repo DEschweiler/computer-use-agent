@@ -325,6 +325,28 @@ COMPUTER_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_chars",
+            "description": (
+                "Press Backspace a specific number of times to delete characters in the "
+                "focused field. Use this when Ctrl+A / Delete failed to clear a field, "
+                "or when you need to erase a known number of characters."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of Backspace keypresses to send (1-200).",
+                    },
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["count", "thought"],
+            },
+        },
+    },
 ]
 
 # Verification-only tools: offered ONLY during completion verification.
@@ -905,6 +927,13 @@ class ActionExecutor:
                 result = int(a) + int(b) if op == "+" else int(a) - int(b)
                 return f"result: {result}"
 
+            if action_type == "delete_chars":
+                count = max(1, min(int(args.get("count", 1)), 200))
+                for _ in range(count):
+                    pyautogui.press("backspace")
+                    time.sleep(0.03)
+                return f"pressed backspace {count} times"
+
             return f"error: unknown action {action_type}"
 
         except pyautogui.FailSafeException:
@@ -1028,23 +1057,33 @@ class ProgressTrail:
 
     def thrashing_warning(self) -> Optional[str]:
         """
-        Detect thrashing over the last 6 entries. Thrashing = cycling between
-        ≤3 distinct action targets with no visible screen change.
+        Detect thrashing: look at the trailing run of consecutive no-change
+        entries (ignoring any earlier screen changes). If the last 3+ entries
+        all had no screen change and hit ≤3 distinct targets, warn.
         """
-        recent = list(self._entries)[-6:]
-        if len(recent) < 4:
+        all_entries = list(self._entries)
+        # Walk backwards to find the longest trailing run with no screen change.
+        tail = []
+        for e in reversed(all_entries):
+            if e.screen_changed:
+                break
+            tail.append(e)
+        tail = list(reversed(tail))  # chronological order
+
+        if len(tail) < 3:
             return None
-        if any(e.screen_changed for e in recent):
-            return None
-        targets = {e.target_key for e in recent if e.target_key}
+        targets = {e.target_key for e in tail if e.target_key}
         if 0 < len(targets) <= 3:
             tlist = ", ".join(sorted(targets))
             return (
-                f"⚠ THRASHING DETECTED: in the last {len(recent)} steps you have acted "
-                f"on only {{{tlist}}} with NO visible screen change. Stop repeating. "
-                "Consider: (a) wait(2) in case the app is slow, (b) try keyboard Tab "
-                "to reach the target, (c) focus a different window, (d) re-read the "
-                "screen carefully — the target may not be where you think it is."
+                f"⚠ THRASHING DETECTED: the last {len(tail)} actions all had NO visible "
+                f"screen change and targeted only {{{tlist}}}. Stop repeating. "
+                "Consider: (a) wait(2) in case the app is slow,"
+                "(b) read your own thoughts and re-assess what you did and can do "
+                "(c) try keyboard Tab to reach the target, "
+                "(c) try a keyboard shortcut to submit instead of clicking, "
+                "(d) focus a different window, "
+                "(e) re-read the screen — the target may not be where you think it is."
             )
         return None
 
@@ -1335,11 +1374,17 @@ class ConversationHistory:
 
 SYSTEM_PROMPT = """\
 You are an expert AI agent controlling a computer via OCR + screenshot observation. \
-You receive, every step: (1) an annotated screenshot with orange OCR boxes and stable \
-IDs drawn on interactive text, plus a cyan crosshair marking your last click; \
-(2) a text list of those OCR elements in the form [id] 'text' @(cx,cy) with \
-screen-absolute coordinates; (3) a PROGRESS SO FAR block summarizing what you have \
-done, what you thought, and what changed.
+You receive, every step: (1) a PROGRESS SO FAR block summarizing what you have \
+done, what you thought, and what changed; (2) a text list of OCR elements \
+in the form [id] 'text' @(cx,cy) with screen-absolute coordinates; (3) an \
+annotated screenshot with orange OCR boxes showing the listed elements and stable \
+IDs drawn on interactive text, plus a cyan crosshair marking your last click.
+
+BEFORE EVERY ACTION — read the PROGRESS SO FAR block carefully. For each \
+listed step, ask: Did that action succeed? Did the result build toward the \
+goal? If a prior step produced useful information (e.g. a window list, a \
+coordinate, a confirmed click), use it directly — do NOT repeat that step. \
+Only pick an action that meaningfully advances on what is already known. \
 
 REASONING PATTERN — for every action, include a 'thought' that covers:
   1. What changed since my last action, and does it match what I expected?
@@ -1355,7 +1400,15 @@ RULES:
   whether your typed text appears in the next element list.
 - If OCR shows text that should have been cleared is still there, your clear \
   attempt (Ctrl+A, Backspace, Delete) did NOT succeed. Do not just retype — \
-  try a different clear approach or you will append instead of replace.
+  try a different clear approach or you will append instead of replace. \
+  If Ctrl+A did not select the text, click the field to focus it, then call \
+  delete_chars with the number of characters you need to erase (e.g. \
+  delete_chars(10) to erase 10 chars).
+- If the cyan crosshair in the screenshot is visibly off from your intended \
+  target (e.g. an edit field and you clicked on a label), do NOT repeat the same \
+  click blindly. Instead, use calculate to derive corrected coordinates \
+  (e.g. element_cx + 40) from the nearest element's @(cx,cy) listed below, then \
+  click with raw x/y.
 - If the screen does not change after an action, do NOT repeat the same action. \
   Reassess. If thrashing is warned about, change approach entirely.
 - If you expect a delay (save, dialog appearing, data loading), use wait() \
@@ -1373,7 +1426,6 @@ RULES:
   must keep working.
 - Work in the UI's language (German or English).
 """
-
 
 @dataclass
 class AgentConfig:
@@ -1628,7 +1680,7 @@ class ComputerAgent:
                 except json.JSONDecodeError:
                     args = {}
                 thought = (args.get("thought") or "").strip()
-                log.info("→ %s(%s)", fn_name, {k: v for k, v in args.items() if k != "thought"})
+                log.info("[TOOL] → %s(%s)", fn_name, {k: v for k, v in args.items() if k != "thought"})
                 if thought:
                     log.info("[THOUGHT] %s", thought)
 
@@ -1730,12 +1782,18 @@ class ComputerAgent:
                 eid = args.get("element_id", "")
                 el = pre_action_elements.get(eid)
                 target_label = el.text.strip() if el else ""
+                # Condense list_windows output: keep titles but drop the header line.
+                trail_result = result
+                if fn_name == "list_windows":
+                    found = [line.strip().lstrip("- ") for line in result.splitlines()
+                             if line.strip().startswith("-")]
+                    trail_result = f"{len(found)} windows: {'; '.join(found)}"
                 trail.record(TrailEntry(
                     iteration=iteration + 1,
                     action=fn_name,
                     target_key=target_key_from_args(fn_name, args),
                     thought=thought,
-                    result=result,
+                    result=trail_result,
                     screen_changed=screen_changed,
                     target_label=target_label,
                 ))
