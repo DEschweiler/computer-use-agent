@@ -281,7 +281,12 @@ COMPUTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "double_click",
-            "description": "Double-click an element or coordinate.",
+            "description": (
+                "Double-click an element or coordinate. In text fields this selects the "
+                "word under the cursor — you can then type to replace it or press Delete "
+                "to remove it. Repeat on remaining words to clear a field word-by-word "
+                "when Ctrl+A does not work."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -411,10 +416,12 @@ COMPUTER_TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "2-5 short strings, each quoting OUTCOME text literally "
-                            "as it appears on screen. Not labels. Not field names. "
-                            "Things like typed values, confirmation messages, new "
-                            "list rows, changed statuses."
+                            "2-5 strings, each being a SHORT, VERBATIM snippet copied "
+                            "directly from the OCR text on screen — ideally just the "
+                            "raw value itself (e.g. '444444', 'Gespeichert', "
+                            "'Max Mustermann'). Do NOT add any surrounding words, "
+                            "explanations, or context ('field shows', 'updated to', "
+                            "etc.) — only the literal text as OCR reads it."
                         ),
                     },
                     "thought": _THOUGHT_PARAM,
@@ -481,16 +488,16 @@ COMPUTER_TOOLS = [
         "function": {
             "name": "delete_chars",
             "description": (
-                "Press Backspace a specific number of times to delete characters in the "
-                "focused field. Use this when Ctrl+A / Delete failed to clear a field, "
-                "or when you need to erase a known number of characters."
+                "Press End (move cursor to end of field) then Backspace a specific number "
+                "of times. Use as a last resort when both Ctrl+A and double_click failed. "
+                "Count should match the number of characters currently in the field."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "count": {
                         "type": "integer",
-                        "description": "Number of Backspace keypresses to send (1-200).",
+                        "description": "Number of Backspace keypresses to send after moving to End (1-500).",
                     },
                     "thought": _THOUGHT_PARAM,
                 },
@@ -520,9 +527,10 @@ _VERIFICATION_TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "2-5 short strings quoting OUTCOME text: typed values "
-                            "now visible, confirmation messages, new rows, changed "
-                            "statuses. Not labels or field names."
+                            "2-5 strings, each being a SHORT, VERBATIM snippet copied "
+                            "directly from the OCR text on screen — ideally just the "
+                            "raw value itself (e.g. '444444', 'Gespeichert'). "
+                            "Do NOT add surrounding words or context."
                         ),
                     },
                     "thought": _THOUGHT_PARAM,
@@ -1008,6 +1016,7 @@ _KEY_MAP = {
     "return": "enter",
     "esc": "esc", "escape": "esc",
     "arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
+    "delete": "del",
 }
 
 
@@ -1085,7 +1094,9 @@ class ActionExecutor:
                 if not keys:
                     return "error: no keys"
                 if len(keys) == 1:
+                    time.sleep(0.1)
                     pyautogui.press(keys[0])
+                    time.sleep(0.1)
                 else:
                     time.sleep(0.2)
                     pyautogui.hotkey(*keys)
@@ -1124,11 +1135,13 @@ class ActionExecutor:
                 return f"result: {result}"
 
             if action_type == "delete_chars":
-                count = max(1, min(int(args.get("count", 1)), 200))
+                count = max(1, min(int(args.get("count", 1)), 500))
+                pyautogui.press("end")
+                time.sleep(0.1)
                 for _ in range(count):
                     pyautogui.press("backspace")
-                    time.sleep(0.03)
-                return f"pressed backspace {count} times"
+                    time.sleep(0.02)
+                return f"pressed End then backspace {count} times"
 
             return f"error: unknown action {action_type}"
 
@@ -1342,7 +1355,7 @@ def _best_fuzzy_match(word: str, ocr_blob: str) -> Tuple[float, str]:
 def check_evidence_in_ocr(
     evidence: List[str],
     elements: List[Element],
-    min_hit_ratio: float = 0.7,
+    min_hit_ratio: float = 0.6,
     fuzzy_threshold: float = 0.82,
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
@@ -1455,14 +1468,18 @@ class ConversationHistory:
         self._messages: List[dict] = [{"role": "system", "content": system_prompt}]
         self._keep_recent = keep_recent
         self._keep_tool_turns = keep_tool_turns
-        self._pinned_user_idx: Optional[int] = None
+        self._task: str = ""
 
     def add_initial_user(self, task: str, element_text: str, screenshot_b64: str) -> None:
+        """Send the first observation: screenshot → elements → task (no progress trail yet)."""
+        self._task = task
         self._messages.append({
             "role": "user",
-            "content": f"TASK: {task}",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+                {"type": "text", "text": f"{element_text}\n\nTASK: {task}"},
+            ],
         })
-        self._pinned_user_idx = len(self._messages) - 1
 
     def add_assistant(self, message: dict) -> None:
         self._messages.append(message)
@@ -1497,12 +1514,17 @@ class ConversationHistory:
         return added
 
     def add_observation(self, element_text: str, screenshot_b64: str, note: str = "") -> None:
-        text = (note + "\n\n" if note else "") + f"Updated screen:\n{element_text}"
+        """Append an observation message ordered: screenshot → elements → task → progress."""
+        text = element_text
+        if self._task:
+            text += f"\n\nTASK: {self._task}"
+        if note:
+            text += f"\n\n{note}"
         self._messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+                {"type": "text", "text": text},
             ],
         })
 
@@ -1528,7 +1550,6 @@ class ConversationHistory:
             i for i, m in enumerate(msgs)
             if m.get("role") == "user" and isinstance(m.get("content"), list)
             and any(c.get("type") == "image_url" for c in m["content"])
-            and i != self._pinned_user_idx
         ]
         keep_vision = set(vision_indices[-self._keep_recent:])
         for i in vision_indices:
@@ -1558,26 +1579,19 @@ class ConversationHistory:
 
         return [m for i, m in enumerate(msgs) if i not in to_drop]
 
-    @staticmethod
-    def _summarize_old_observation(text: str) -> str:
-        lines = [l for l in text.splitlines() if l.strip()]
-        element_count = sum(1 for l in lines if l.startswith("[e"))
-        header = lines[0][:120] if lines else "(prior observation)"
-        return f"[earlier observation — {element_count} elements on screen] {header}"
-
 
 # --- Agent ----------------------------------------------------------------- #
 
 SYSTEM_PROMPT = """\
 You are an expert AI agent controlling a computer via OCR + screenshot observation. \
-You receive, every step: (1) a PROGRESS SO FAR block summarizing what you have \
-done, what you thought, and what changed; (2) two element lists — \
+You receive, every step: (1) an annotated screenshot with orange boxes for OCR \
+elements and blue boxes for interactive regions, both labeled with stable IDs, plus \
+a cyan crosshair marking your last click; (2) two element lists — \
 "OCR TEXT ELEMENTS" in the form [id] 'text' @(cx,cy), and \
 "INTERACTIVE REGIONS" in the form [id] <interactive> @(cx,cy) WxH (visually detected \
 buttons, icons, and empty input fields that OCR cannot see); all coordinates are \
-screen-absolute; (3) an annotated screenshot with orange boxes for OCR elements \
-and blue boxes for interactive regions, both labeled with stable IDs, plus a cyan \
-crosshair marking your last click.
+screen-absolute; (3) a TASK reminder; (4) a PROGRESS SO FAR block summarizing \
+what you have done, what you thought, and what changed.
 
 BEFORE EVERY ACTION — read the PROGRESS SO FAR block carefully. For each \
 listed step, ask: Did that action succeed? Did the result build toward the \
@@ -1589,7 +1603,7 @@ REASONING PATTERN — for every action, include a 'thought' that covers:
   1. What changed since my last action, and does it match what I expected?
   2. What I am doing now.
   3. What I expect to happen next.
-Keep it under 40 words. This is how you remember your plan and notice mistakes.
+Keep it under 50 words. This is how you remember your plan and notice mistakes.
 
 RULES:
 - Prefer element_id over raw x/y. Coordinates are screen-absolute.
@@ -1601,11 +1615,16 @@ RULES:
 - INTERACTIVE REGIONS (<interactive>) have no text — use their element_id to click them. \
   They represent buttons, icons, and empty fields the OCR cannot read.
 - If OCR shows text that should have been cleared is still there, your clear \
-  attempt (Ctrl+A, Backspace, Delete) did NOT succeed. Do not just retype — \
-  try a different clear approach or you will append instead of replace. \
-  If Ctrl+A did not select the text, click the field to focus it, then call \
-  delete_chars with the number of characters you need to erase (e.g. \
-  delete_chars(10) to erase 10 chars).
+  attempt did NOT succeed — do not retype or you will append instead of replace. \
+  Use this escalation ladder until one works: \
+  (1) keypress(['ctrl','a']) then keypress(['backspace']) — backspace after select-all \
+  reliably deletes the selection on all platforms including Citrix; do NOT use delete here \
+  as it is an extended key that Citrix may not handle correctly; \
+  (2) double_click the field to select the word under the cursor, then press \
+  Delete to remove it — repeat for each remaining word to clear the field \
+  word-by-word; this works on virtually every platform even when Ctrl+A does not; \
+  (3) delete_chars(N) where N is the number of characters in the field — \
+  this presses End first so cursor position does not matter.
 - If the cyan crosshair in the screenshot is visibly off from your intended \
   target (e.g. an edit field and you clicked on a label), do NOT repeat the same \
   click blindly. Instead, use calculate to derive corrected coordinates \
