@@ -1661,7 +1661,6 @@ class AgentConfig:
     request_timeout: int = 120
     request_retries: int = 2
     verify_tls: bool = False
-    ocr_upscale: float = 3.0
     ocr_min_conf: int = 30
     save_debug_screenshots: bool = True
 
@@ -2035,7 +2034,7 @@ class ComputerAgent:
                 break
 
             # Observe new screen state.
-            time.sleep(0.6)
+            time.sleep(0.2)
             self.executor.tick_click_age()
             screenshot_b64, elements = self._parse_screen()
             new_sig = ocr_signature(elements)
@@ -2129,7 +2128,7 @@ class ComputerAgent:
         corrective actions.
         """
         log.info("Verifying completion: %s", claim)
-        time.sleep(0.6)
+        time.sleep(0.1)
         self.executor.tick_click_age()
         screenshot_b64, elements = self._parse_screen()
 
