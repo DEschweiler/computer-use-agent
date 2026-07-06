@@ -560,6 +560,99 @@ _VERIFICATION_TOOLS = [
 ]
 
 
+# --- Navigator (goal-holding critic) --------------------------------------- #
+#
+# The navigator is a SEPARATE, cheap, text-only reasoning role. It never touches
+# the mouse or keyboard. Each step it looks at the ultimate goal, the change-set
+# ("what the last action caused"), and the progress trail — from a neutral
+# outside viewpoint — and answers: are we closer, further, or stuck, and what is
+# the single next objective the actioner should pursue. On 'stuck' it may force a
+# replan by issuing a different next_intent; corrective moves (dismiss a dialog,
+# scroll back) are expressed as intents that the actioner executes through its
+# own guarded tools — preserving a single action pathway.
+
+NAVIGATOR_SYSTEM_PROMPT = """\
+You are the NAVIGATOR for a computer-use agent operating a hospital information \
+system (HIS). You do NOT control the mouse or keyboard — a separate ACTIONER \
+does that. Your job is to keep the actioner oriented toward the ultimate goal.
+
+You cannot assume a fixed click-path: the HIS layout is not known in advance and \
+each action's consequences are only learned by observing the screen afterward. \
+So you work in a closed loop: hold the ultimate goal, and after each action judge \
+whether it moved the agent CLOSER to that goal, then set the next concrete \
+objective.
+
+Every step you receive:
+  - ULTIMATE GOAL — the user's task; this never changes.
+  - CURRENT OBJECTIVE — what the actioner was just trying to do.
+  - SINCE THE LAST ACTION — a ground-truth diff of what changed on screen \
+(elements that appeared, disappeared, moved, or whose text changed; and whether \
+a scroll, popup, or full screen-replacement occurred). The environment is \
+quiescent between actions, so these changes were caused by the last action.
+  - PROGRESS SO FAR — the history of actions and their outcomes.
+  - CURRENT SCREEN ELEMENTS — the text/elements currently visible.
+
+Call `assess` exactly once with:
+  - status: on_track | off_track | stuck | goal_reached
+  - reasoning: ONE sentence — did the last action move closer to the goal?
+  - next_intent: the SINGLE next objective for the actioner, phrased as a concrete \
+instruction achievable in a few actions (e.g. "open the patient search and enter \
+ID 444444", not "complete the task"). Keep the objective small and verifiable.
+  - guidance (optional): a short tactical correction, especially when off_track or \
+stuck — e.g. "a confirmation dialog is open; dismiss it before anything else", \
+"the field scrolled out of view, scroll up ~200px to bring it back", or "this \
+approach has not changed the screen twice; try keyboard Tab instead of clicking".
+
+Rules:
+  - Judge only against the ULTIMATE GOAL, not against whether the last action \
+"worked" in isolation. An action can succeed yet move away from the goal.
+  - If SINCE THE LAST ACTION shows a popup/dialog or a screen replacement, the \
+next_intent must deal with that first.
+  - Only report goal_reached when the diff/screen shows concrete OUTCOME evidence \
+of success (a typed value now present, a success message, a new row) — not merely \
+that the right form or menu is visible.
+  - Be decisive and brief. You are the map, not the driver.
+"""
+
+NAVIGATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "assess",
+            "description": (
+                "Report where the task stands relative to the ULTIMATE GOAL and set "
+                "the next concrete objective for the actioner."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["on_track", "off_track", "stuck", "goal_reached"],
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "One sentence: did the last action move closer to the ultimate goal?",
+                    },
+                    "next_intent": {
+                        "type": "string",
+                        "description": (
+                            "The single next objective for the actioner, as a concrete "
+                            "instruction achievable in a few actions."
+                        ),
+                    },
+                    "guidance": {
+                        "type": "string",
+                        "description": "Optional short tactical correction or hint for the actioner.",
+                    },
+                },
+                "required": ["status", "reasoning", "next_intent"],
+            },
+        },
+    },
+]
+
+
 # --- DPI awareness --------------------------------------------------------- #
 
 def _enable_dpi_awareness() -> None:
@@ -611,8 +704,97 @@ class Element:
         return f"[{self.stable_id}] '{text}' @({self.center_x},{self.center_y})"
 
 
+@dataclass
+class ElementChange:
+    """A single per-element delta between two consecutive frames."""
+    kind: str            # 'appeared' | 'disappeared' | 'moved' | 'text_changed'
+    element: Element     # the CURRENT element (for disappeared, the last-seen one)
+    old_text: str = ""   # text_changed only
+    dx: int = 0          # moved only (new - old center)
+    dy: int = 0          # moved only
+
+    def as_line(self) -> str:
+        el = self.element
+        if el.source == "yolo":
+            label = f"[{el.stable_id}] <interactive> @({el.center_x},{el.center_y})"
+        else:
+            t = (el.text or "").replace("\n", " ").strip()
+            if len(t) > 40:
+                t = t[:37] + "..."
+            label = f"[{el.stable_id}] '{t}'"
+        if self.kind == "text_changed":
+            return f"{label}  ('{self.old_text}' → '{el.text}')"
+        if self.kind == "moved":
+            return f"{label}  (moved {self.dx:+d},{self.dy:+d})"
+        return label
+
+
+@dataclass
+class ChangeSet:
+    """
+    Ground-truth summary of what changed between the previous frame and this one,
+    derived from the ElementRegistry's stable-ID reconciliation. This is the
+    observation the agents reason over — "what my last action caused" — rather
+    than a bare snapshot of the current screen.
+
+    `transition` names a whole-screen event when one is detected, so a scroll or
+    a dialog does not flood the per-element diff:
+      '' (local edits) | 'scroll' | 'popup' | 'replaced'
+    """
+    appeared: List[ElementChange] = field(default_factory=list)
+    disappeared: List[ElementChange] = field(default_factory=list)
+    moved: List[ElementChange] = field(default_factory=list)
+    text_changed: List[ElementChange] = field(default_factory=list)
+    transition: str = ""
+    scroll_dy: int = 0        # scroll only: median vertical shift (+ = content moved down)
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.appeared or self.disappeared or self.moved or self.text_changed)
+
+    def render(self) -> str:
+        """Human/LLM-readable 'SINCE YOUR LAST ACTION' block. Empty string if nothing changed."""
+        if self.transition == "replaced":
+            return (
+                "SINCE YOUR LAST ACTION: the screen was REPLACED "
+                f"(≈{len(self.disappeared)} elements gone, "
+                f"{len(self.appeared)} new). You are likely on a different view/window."
+            )
+        if self.transition == "scroll":
+            direction = "down" if self.scroll_dy < 0 else "up"
+            gone = ", ".join(c.as_line() for c in self.disappeared[:8]) or "(none)"
+            new = ", ".join(c.as_line() for c in self.appeared[:8]) or "(none)"
+            return (
+                f"SINCE YOUR LAST ACTION: SCROLLED {direction} ≈{abs(self.scroll_dy)}px. "
+                f"Left the viewport: {gone}. Newly visible: {new}. "
+                "To return to what you had before, scroll the opposite direction."
+            )
+
+        lines: List[str] = []
+        if self.transition == "popup":
+            lines.append(
+                "A DIALOG/POPUP appeared on top of the previous screen "
+                "(existing elements stayed). Deal with the dialog before anything else."
+            )
+        if self.text_changed:
+            lines.append("changed: " + "; ".join(c.as_line() for c in self.text_changed[:12]))
+        if self.appeared:
+            lines.append("appeared: " + ", ".join(c.as_line() for c in self.appeared[:12]))
+        if self.disappeared:
+            lines.append("disappeared: " + ", ".join(c.as_line() for c in self.disappeared[:12]))
+        if self.moved:
+            lines.append("moved: " + ", ".join(c.as_line() for c in self.moved[:8]))
+        if not lines:
+            return "SINCE YOUR LAST ACTION: no visible change on screen."
+        return "SINCE YOUR LAST ACTION:\n  " + "\n  ".join(lines)
+
+
 class ElementRegistry:
     """Assigns short stable IDs to OCR elements across parses."""
+
+    # A matched element must shift at least this many px (either axis) to count
+    # as "moved" — filters OCR jitter and sub-pixel box wobble.
+    _MOVE_EPS = 8
 
     def __init__(self, match_threshold: float = 0.62, evict_after_frames: int = 20):
         self._by_id: Dict[str, Element] = {}
@@ -645,33 +827,152 @@ class ElementRegistry:
             + 0.20 * pos_sim + 0.10 * size_sim
         )
 
-    def reconcile(self, new_elements: List[Element], screen_w: int, screen_h: int) -> List[Element]:
+    def reconcile(
+        self, new_elements: List[Element], screen_w: int, screen_h: int
+    ) -> Tuple[List[Element], ChangeSet]:
+        """Assign stable IDs and, as a side product, compute the frame-to-frame
+        ChangeSet (appeared / disappeared / moved / text-changed + transition)."""
+        prev_frame = self._frame
         self._frame += 1
+        # Shallow copy so old Element objects survive the in-place id reassignments
+        # below (we replace dict values, we don't mutate the old objects).
+        prev_snapshot = dict(self._by_id)
+        prev_visible_ids = {
+            rid for rid, el in prev_snapshot.items() if el.last_seen_frame == prev_frame
+        }
+
+        # Position gate: a real element never teleports horizontally, and moves
+        # vertically only within roughly a screen (scroll). Reject candidate
+        # matches beyond these bounds even when text is similar — this stops a
+        # button ('Speichern') from being relabeled as a far-away status
+        # ('Gespeichert'), which both pollutes the change-set and corrupts the
+        # stable IDs the executor clicks by.
+        max_dx = 0.30 * screen_w
+        max_dy = 0.85 * screen_h
+
         unmatched_ids = set(self._by_id.keys())
         result: List[Element] = []
+        change = ChangeSet()
+        matched_ids: set = set()
         for elem in new_elements:
             best_id, best_score = None, self._match_threshold
             for rid in unmatched_ids:
                 old = self._by_id[rid]
+                if abs(elem.center_x - old.center_x) > max_dx:
+                    continue
+                if abs(elem.center_y - old.center_y) > max_dy:
+                    continue
                 score = self._similarity(elem, old, screen_w, screen_h)
                 if score > best_score:
                     best_score = score
                     best_id = rid
             if best_id is not None:
+                old = prev_snapshot[best_id]
                 elem.stable_id = best_id
                 elem.last_seen_frame = self._frame
                 self._by_id[best_id] = elem
                 unmatched_ids.remove(best_id)
+                matched_ids.add(best_id)
+                # Only diff against elements that were actually visible last frame.
+                if best_id in prev_visible_ids:
+                    if elem.text.strip() != old.text.strip():
+                        change.text_changed.append(
+                            ElementChange("text_changed", elem, old_text=old.text.strip())
+                        )
+                    dx = elem.center_x - old.center_x
+                    dy = elem.center_y - old.center_y
+                    if abs(dx) >= self._MOVE_EPS or abs(dy) >= self._MOVE_EPS:
+                        change.moved.append(ElementChange("moved", elem, dx=dx, dy=dy))
             else:
                 elem.stable_id = self._mint_id()
                 elem.last_seen_frame = self._frame
                 self._by_id[elem.stable_id] = elem
+                # Genuinely new only if there was a prior frame to be new against.
+                if prev_frame > 0:
+                    change.appeared.append(ElementChange("appeared", elem))
             result.append(elem)
+
+        # Disappeared = visible last frame, not matched this frame.
+        for rid in prev_visible_ids - matched_ids:
+            change.disappeared.append(ElementChange("disappeared", prev_snapshot[rid]))
+
+        # The similarity matcher is text-weighted, so an in-place value replacement
+        # (a field going 'Speichern' → '444444', or an empty YOLO field → typed text)
+        # falls below threshold and lands as a disappeared+appeared pair at the same
+        # box. Re-pair those into text_changed — it's the #1 form-filling signal.
+        self._pair_inplace_text_changes(change)
+
+        self._classify_transition(change, len(prev_visible_ids))
+
         stale = [rid for rid, el in self._by_id.items()
                  if self._frame - el.last_seen_frame > self._evict_after]
         for rid in stale:
             del self._by_id[rid]
-        return result
+        return result, change
+
+    @staticmethod
+    def _box_iou(a: Element, b: Element) -> float:
+        ix1, iy1 = max(a.x, b.x), max(a.y, b.y)
+        ix2 = min(a.x + a.width, b.x + b.width)
+        iy2 = min(a.y + a.height, b.y + b.height)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        union = a.width * a.height + b.width * b.height - inter
+        return inter / union if union > 0 else 0.0
+
+    def _pair_inplace_text_changes(self, change: ChangeSet, iou_thresh: float = 0.3) -> None:
+        """Collapse co-located disappeared+appeared pairs into text_changed."""
+        if not change.appeared or not change.disappeared:
+            return
+        used: set = set()
+        kept_appeared: List[ElementChange] = []
+        for app in change.appeared:
+            best_i, best_iou = None, iou_thresh
+            for i, dis in enumerate(change.disappeared):
+                if i in used:
+                    continue
+                iou = self._box_iou(app.element, dis.element)
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i is None:
+                kept_appeared.append(app)
+            else:
+                used.add(best_i)
+                old_text = change.disappeared[best_i].element.text.strip()
+                change.text_changed.append(
+                    ElementChange("text_changed", app.element, old_text=old_text)
+                )
+        change.appeared = kept_appeared
+        change.disappeared = [d for i, d in enumerate(change.disappeared) if i not in used]
+
+    @staticmethod
+    def _classify_transition(change: ChangeSet, prev_n: int) -> None:
+        """Detect a whole-screen event (scroll / popup / replaced) from the raw
+        deltas, so downstream renderers can collapse the noise into one fact."""
+        if prev_n == 0:
+            return  # first frame — everything is 'appeared', not a transition
+        gone, new = len(change.disappeared), len(change.appeared)
+
+        # Screen replaced: most of the previous screen gone, lots of new content.
+        if prev_n >= 5 and gone >= 0.7 * prev_n and new >= max(3, 0.4 * prev_n):
+            change.transition = "replaced"
+            return
+
+        # Scroll: a coherent block of elements shifted by a common vertical delta.
+        if len(change.moved) >= 3:
+            dys = sorted(c.dy for c in change.moved)
+            median = dys[len(dys) // 2]
+            if abs(median) >= 20:
+                coherent = sum(1 for c in change.moved if abs(c.dy - median) <= 15)
+                if coherent >= 3 and coherent >= 0.6 * len(change.moved):
+                    change.transition = "scroll"
+                    change.scroll_dy = median
+                    return
+
+        # Popup/dialog: prior screen mostly intact, a cluster of new elements arrived.
+        if new >= 3 and gone <= 2 and prev_n >= 3 and (prev_n - gone) >= 0.6 * prev_n:
+            change.transition = "popup"
 
     def get(self, stable_id: str) -> Optional[Element]:
         return self._by_id.get(stable_id)
@@ -1606,7 +1907,12 @@ REASONING PATTERN — for every action, include a 'thought' that covers:
 Keep it under 50 words. This is how you remember your plan and notice mistakes.
 
 RULES:
-- Prefer element_id over raw x/y. Coordinates are screen-absolute.
+- At the start of every task, call list_windows then focus_window to bring the \
+  correct application to the foreground before taking any other action.
+- Prefer element_id over raw x/y. Coordinates are screen-absolute. \
+  If you must use raw x/y, always derive them from the @(cx,cy) values in the \
+  current element list — it should always be in pixel coordinates, not in ratios. Use the \
+  calculate tool to adjust (e.g. cx + 40) when the click target is beside a label.
 - Form fields are often NOT detected by OCR when empty — only the label beside \
   them is. An empty field may appear as an INTERACTIVE REGION (blue box, <interactive>); \
   click it by element_id if present. Otherwise click just to the right of the \
@@ -1645,6 +1951,13 @@ RULES:
   most likely not done — keep working instead of calling finish_task. \
   Your evidence is checked against OCR; bogus evidence is rejected and you \
   must keep working.
+- You may issue MULTIPLE tool calls in a single response whenever you are \
+  confident the actions are safe to run in sequence without seeing the \
+  intermediate result first (e.g. list_windows → focus_window, or filling \
+  several known fields with click_and_type, or a keypress followed by \
+  type_text). Batch such steps into one response to save round-trips. \
+  Do NOT batch actions whose target or arguments depend on what the screen \
+  shows after a previous action in the same batch.
 - Work in the UI's language (German or English).
 """
 
@@ -1663,6 +1976,30 @@ class AgentConfig:
     verify_tls: bool = False
     ocr_min_conf: int = 30
     save_debug_screenshots: bool = True
+    # Navigator (goal-holding critic). When enabled, a cheap text-only role
+    # re-assesses progress toward the goal each step and sets the actioner's
+    # next objective. Set NAVIGATOR=0 in the environment to A/B against the
+    # plain ReAct loop.
+    use_navigator: bool = True
+    navigator_max_tokens: int = 400
+
+
+@dataclass
+class NavigatorState:
+    """The navigator's running belief: fixed goal + evolving objective/assessment."""
+    ultimate_goal: str = ""
+    current_intent: str = ""          # the objective the actioner is pursuing now
+    last_status: str = ""             # on_track | off_track | stuck | goal_reached
+    last_reasoning: str = ""
+    guidance: str = ""                # tactical hint injected into the actioner's note
+    stuck_rounds: int = 0             # consecutive navigator 'stuck'/'off_track' verdicts
+
+    def render_for_actioner(self) -> str:
+        """The block prepended to the actioner's observation each step."""
+        lines = [f"CURRENT OBJECTIVE (set by navigator): {self.current_intent}"]
+        if self.guidance:
+            lines.append(f"NAVIGATOR GUIDANCE: {self.guidance}")
+        return "\n".join(lines)
 
 
 class ComputerAgent:
@@ -1693,10 +2030,11 @@ class ComputerAgent:
 
     # --- screen parsing --------------------------------------------------- #
 
-    def _parse_screen(self) -> Tuple[str, List[Element]]:
+    def _parse_screen(self) -> Tuple[str, List[Element], ChangeSet]:
         """
         Capture foreground window, run OCR, reconcile IDs, ANNOTATE the image
-        (boxes + IDs + crosshair at last-click), return (base64 of annotated image, elements).
+        (boxes + IDs + crosshair at last-click), return (base64 of annotated
+        image, elements, change-set-vs-previous-frame).
         """
         t0 = time.monotonic()
         screenshot, (win_x, win_y, win_w, win_h) = capture_foreground()
@@ -1740,7 +2078,7 @@ class ComputerAgent:
                 continue  # overlaps an OCR box — skip
             merged.append(icon_el)
 
-        reconciled = self.registry.reconcile(merged, self.width, self.height)
+        reconciled, change = self.registry.reconcile(merged, self.width, self.height)
 
         # Annotate — same image for LLM and for the debug screenshot file.
         annotated = annotate_screenshot(
@@ -1755,7 +2093,7 @@ class ComputerAgent:
         annotated.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
 
-        return b64, reconciled
+        return b64, reconciled, change
 
     def _save_debug(self, annotated: Image.Image) -> None:
         """Write the SAME annotated image to the shared debug path."""
@@ -1839,15 +2177,19 @@ class ComputerAgent:
         except Exception:
             pass  # never let debug output break the agent
 
-    def _call_llm(self, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
+    def _call_llm(
+        self, messages: List[dict], tools: Optional[List[dict]] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
         self._dump_context(messages)
         payload = {
             "model": self.cfg.model,
             "messages": messages,
             "tools": tools if tools is not None else COMPUTER_TOOLS,
             "tool_choice": "auto",
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self.cfg.max_tokens,
             "temperature": self.cfg.temperature,
+            "skip_special_tokens": False,
         }
         headers = {
             "Authorization": f"Bearer {self.cfg.api_key}",
@@ -1869,6 +2211,76 @@ class ComputerAgent:
                 time.sleep(wait)
         raise RuntimeError(f"LLM call failed after {self.cfg.request_retries + 1} attempts: {last_exc}")
 
+    # --- navigator (goal-holding critic) ---------------------------------- #
+
+    def _navigate(
+        self,
+        nav: "NavigatorState",
+        change: ChangeSet,
+        trail: ProgressTrail,
+        elements_text: str,
+        tokens: Dict[str, int],
+    ) -> None:
+        """Re-assess progress toward the ultimate goal from a neutral, text-only
+        outside viewpoint, and update `nav` in place (objective + guidance). Runs
+        in its own short context (not the actioner's history) — cheap, and the
+        separation is what gives the 'neutral outside view'. Never executes input.
+        """
+        user = (
+            f"ULTIMATE GOAL: {nav.ultimate_goal}\n"
+            f"CURRENT OBJECTIVE: {nav.current_intent or '(none yet — set the first objective)'}\n\n"
+            f"{change.render()}\n\n"
+            f"{trail.render() or 'PROGRESS SO FAR: (nothing done yet)'}\n\n"
+            f"CURRENT SCREEN ELEMENTS:\n{elements_text}\n\n"
+            "Assess progress toward the ULTIMATE GOAL and set the next objective."
+        )
+        messages = [
+            {"role": "system", "content": NAVIGATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
+        try:
+            resp = self._call_llm(
+                messages, tools=NAVIGATOR_TOOLS, max_tokens=self.cfg.navigator_max_tokens
+            )
+        except Exception as exc:
+            log.warning("Navigator call failed (%s) — keeping previous objective.", exc)
+            return
+
+        tokens["calls"] += 1
+        if "usage" in resp:
+            u = resp["usage"]
+            tokens["input"] += u.get("prompt_tokens", 0)
+            tokens["output"] += u.get("completion_tokens", 0)
+            tokens["total"] += u.get("total_tokens", 0)
+
+        tcs = (resp["choices"][0]["message"].get("tool_calls") or [])
+        if not tcs:
+            log.info("[NAV] no assessment returned — keeping objective %r", nav.current_intent)
+            return
+        try:
+            args = json.loads(tcs[0]["function"]["arguments"] or "{}")
+        except json.JSONDecodeError:
+            args = {}
+
+        nav.last_status = (args.get("status") or "").strip()
+        nav.last_reasoning = (args.get("reasoning") or "").strip()
+        next_intent = (args.get("next_intent") or "").strip()
+        if next_intent:
+            nav.current_intent = next_intent
+        nav.guidance = (args.get("guidance") or "").strip()
+        if nav.last_status == "goal_reached" and not nav.guidance:
+            nav.guidance = (
+                "Navigator believes the goal is reached — if you can cite OUTCOME "
+                "evidence visible on screen, call finish_task; otherwise keep working."
+            )
+        if nav.last_status in ("off_track", "stuck"):
+            nav.stuck_rounds += 1
+        else:
+            nav.stuck_rounds = 0
+
+        log.info("[NAV] %s | %s", nav.last_status or "?", nav.last_reasoning)
+        log.info("[NAV] → objective: %s", nav.current_intent)
+
     # --- main loop -------------------------------------------------------- #
 
     def run(self, instruction: str) -> Dict[str, Any]:
@@ -1885,7 +2297,7 @@ class ComputerAgent:
         self.registry = ElementRegistry()
         self.executor = ActionExecutor(self.width, self.height, self.registry)
 
-        screenshot_b64, elements = self._parse_screen()
+        screenshot_b64, elements, _ = self._parse_screen()  # first frame: no change-set
         elements_text = self._format_elements(elements)
         self._last_ocr_signature = ocr_signature(elements)
 
@@ -1894,12 +2306,22 @@ class ComputerAgent:
             keep_recent=self.cfg.keep_recent_exchanges,
             keep_tool_turns=self.cfg.keep_tool_turns,
         )
-        history.add_initial_user(instruction, elements_text, screenshot_b64)
 
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
         trail = ProgressTrail()
         nudge_count = 0
+
+        # Navigator: set the first objective from the goal + the current screen,
+        # then prepend it to the actioner's first observation.
+        nav: Optional[NavigatorState] = None
+        if self.cfg.use_navigator:
+            nav = NavigatorState(ultimate_goal=instruction)
+            self._navigate(nav, ChangeSet(), trail, elements_text, tokens)
+            initial_text = nav.render_for_actioner() + "\n\n" + elements_text
+        else:
+            initial_text = elements_text
+        history.add_initial_user(instruction, initial_text, screenshot_b64)
 
         for iteration in range(self.cfg.max_iterations):
             log.info("--- iteration %d ---", iteration + 1)
@@ -1932,7 +2354,7 @@ class ComputerAgent:
                 nudge_count += 1
                 if nudge_count >= 2:
                     log.info("Re-parsing screen after repeated text-only responses.")
-                    screenshot_b64, elements = self._parse_screen()
+                    screenshot_b64, elements, _ = self._parse_screen()
                     note = trail.render()
                     note = (note + "\n\n" if note else "") + \
                            "Please issue a tool call to make progress. Include a 'thought'."
@@ -2036,7 +2458,7 @@ class ComputerAgent:
             # Observe new screen state.
             time.sleep(0.2)
             self.executor.tick_click_age()
-            screenshot_b64, elements = self._parse_screen()
+            screenshot_b64, elements, change = self._parse_screen()
             new_sig = ocr_signature(elements)
             screen_changed = new_sig != self._last_ocr_signature
             self._last_ocr_signature = new_sig
@@ -2072,8 +2494,20 @@ class ComputerAgent:
                     target_label=target_label,
                 ))
 
-            # Build the next observation note: trail + thrashing/stuck warnings.
-            note_parts: List[str] = [trail.render()]
+            elements_text = self._format_elements(elements)
+
+            # Navigator re-assesses progress toward the goal (text-only, cheap) and
+            # updates the objective/guidance the actioner sees next.
+            if nav is not None:
+                self._navigate(nav, change, trail, elements_text, tokens)
+
+            # Build the next observation note: navigator objective first (the
+            # steering signal), then the change-set (what the last action caused),
+            # then the full trail, then thrashing/stuck warnings.
+            note_parts: List[str] = []
+            if nav is not None:
+                note_parts.append(nav.render_for_actioner())
+            note_parts.extend([change.render(), trail.render()])
             thrash = trail.thrashing_warning()
             if thrash:
                 log.warning(thrash)
@@ -2091,7 +2525,7 @@ class ComputerAgent:
                 break
 
             note = "\n\n".join(p for p in note_parts if p)
-            history.add_observation(self._format_elements(elements), screenshot_b64, note=note)
+            history.add_observation(elements_text, screenshot_b64, note=note)
 
         duration = time.time() - start
         log.info("=" * 70)
@@ -2130,7 +2564,7 @@ class ComputerAgent:
         log.info("Verifying completion: %s", claim)
         time.sleep(0.1)
         self.executor.tick_click_age()
-        screenshot_b64, elements = self._parse_screen()
+        screenshot_b64, elements, change = self._parse_screen()
 
         # Re-check actor's evidence against the fresh OCR.
         evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
@@ -2146,7 +2580,9 @@ class ComputerAgent:
             return False, "evidence disappeared on re-check of fresh screen"
 
         elements_text = self._format_elements(elements)
-        note_parts = [trail.render()] if trail.entries() else []
+        note_parts = [change.render()] if not change.is_empty else []
+        if trail.entries():
+            note_parts.append(trail.render())
         note_parts.append(
             f"VERIFICATION REQUEST: the actor claimed the task is done ('{claim}') "
             f"and cited evidence:\n  - " + "\n  - ".join(f"'{e}'" for e in evidence) +
@@ -2226,7 +2662,10 @@ def _load_config() -> AgentConfig:
             f"Missing configuration. Set {profile}_ENDPOINT and {profile}_MODEL "
             "(or LLM_ENDPOINT / LLM_MODEL) in your .env file."
         )
-    return AgentConfig(endpoint=endpoint, api_key=api_key, model=model)
+    use_navigator = os.getenv("NAVIGATOR", "1").strip().lower() not in ("0", "false", "no", "off")
+    return AgentConfig(
+        endpoint=endpoint, api_key=api_key, model=model, use_navigator=use_navigator
+    )
 
 
 def interactive(agent: ComputerAgent) -> None:
