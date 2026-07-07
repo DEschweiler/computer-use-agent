@@ -1281,6 +1281,22 @@ def _true_window_rect_windows(hwnd) -> Optional[Tuple[int, int, int, int]]:
     return None
 
 
+def _foreground_rect_win() -> Optional[Tuple[int, int, int, int]]:
+    """Screen-absolute (x, y, w, h) of the foreground window on Windows, or None."""
+    import ctypes
+    import ctypes.wintypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    # Prefer DWM extended frame bounds (excludes drop shadow).
+    rect = _true_window_rect_windows(hwnd)
+    if rect is None:
+        r = ctypes.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    x, y, w, h = rect
+    return (x, y, w, h) if (w > 0 and h > 0) else None
+
+
 def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     Screenshot only the foreground window. Returns (image, (x, y, w, h)) where
@@ -1289,20 +1305,9 @@ def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     if platform.system() == "Windows":
         try:
-            import ctypes
-            import ctypes.wintypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-
-            # Prefer DWM extended frame bounds (excludes drop shadow).
-            rect = _true_window_rect_windows(hwnd)
-            if rect is None:
-                r = ctypes.wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(r))
-                rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
-
-            x, y, w, h = rect
-            if w > 0 and h > 0:
+            rect = _foreground_rect_win()
+            if rect is not None:
+                x, y, w, h = rect
                 img = pyautogui.screenshot(region=(x, y, w, h))
                 return img, (x, y, w, h)
         except Exception as exc:
@@ -1329,6 +1334,109 @@ def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     img = pyautogui.screenshot()
     w, h = img.size
     return img, (0, 0, w, h)
+
+
+# --- Caret removal (temporal de-flicker before OCR) ------------------------ #
+#
+# A focused edit field draws a blinking text caret; RapidOCR reads its thin
+# vertical stroke as 'l'/'I'/'|'/'1', and when it abuts typed text it merges
+# into the word ("Doe" -> "Doel"). Post-OCR filtering cannot undo the merge, so
+# we remove the caret *before* OCR: capture a few frames across the blink cycle,
+# find pixels that change between them (the caret, plus any incidental
+# animation), and inpaint those regions from their surroundings. Polarity-
+# agnostic (fills from neighbouring background), so it works for a dark caret on
+# a light field or vice versa. Requires the caret to blink (>=1 'off' frame).
+
+_DECARET_FRAMES = int(os.getenv("DECARET_FRAMES", "3"))
+_DECARET_INTERVAL_S = float(os.getenv("DECARET_INTERVAL_S", "0.18"))
+_DECARET_DIFF_THRESH = int(os.getenv("DECARET_DIFF_THRESH", "26"))  # 0-255 grayscale delta
+_DECARET_RING_PX = int(os.getenv("DECARET_RING_PX", "3"))          # width of the surrounding ring sampled per region
+
+# Actions after which a focused edit field (and thus a blinking caret) is likely,
+# so the next observation should be captured with caret removal enabled.
+_CARET_INDUCING_ACTIONS = frozenset({
+    "click", "double_click", "click_and_type", "type", "type_text", "keypress",
+})
+
+
+def capture_foreground_burst(
+    n: int = _DECARET_FRAMES, interval_s: float = _DECARET_INTERVAL_S
+) -> Tuple[List[Image.Image], Tuple[int, int, int, int]]:
+    """Capture *n* screenshots of the foreground window *interval_s* apart, all
+    aligned to the same rect, so a blinking caret is caught in multiple phases.
+    Returns (frames, (x, y, w, h)). Falls back to a single frame on any error."""
+    if platform.system() == "Windows":
+        try:
+            rect = _foreground_rect_win()
+            if rect is not None:
+                x, y, w, h = rect
+                frames: List[Image.Image] = []
+                for i in range(max(1, n)):
+                    if i:
+                        time.sleep(interval_s)
+                    frames.append(pyautogui.screenshot(region=(x, y, w, h)))
+                return frames, rect
+        except Exception as exc:
+            log.warning("Foreground burst capture failed (%s); single frame.", exc)
+    img, rect = capture_foreground()
+    return [img], rect
+
+
+def _decaret(frames: List[Image.Image]) -> Image.Image:
+    """Return the first frame with the blinking caret (and any other pixels that
+    changed between frames) replaced by the REAL pixels from the frame where the
+    caret is off — never a synthesised/inpainted colour.
+
+    Method: diff the frames to a change mask, group it into regions (each a
+    blinking element), and for each region sample the field colour in a thin ring
+    that FOLLOWS THE REGION'S SHAPE (dilate(region) - region), excluding every
+    other changed pixel so a neighbouring blinker cannot pollute it. Then pick the
+    frame whose region best matches that surrounding colour (the caret-off frame)
+    and copy its real pixels. This stays correct when the caret abuts text
+    ('Doe|' -> 'Doe') and when several elements blink independently. Needs the
+    caret off in >=1 frame; with <2 frames or on any error, returns frame 0."""
+    if not frames:
+        raise ValueError("_decaret: no frames")
+    ref = frames[0]
+    if len(frames) < 2:
+        return ref
+    try:
+        import cv2
+        arrs = [np.asarray(f.convert("RGB")).astype(np.uint8) for f in frames]
+        h = min(a.shape[0] for a in arrs)
+        w = min(a.shape[1] for a in arrs)
+        arrs = [a[:h, :w] for a in arrs]                 # guard off-by-one size drift
+        stack = np.stack(arrs, axis=0).astype(np.int16)  # (N, h, w, 3)
+        lum = stack.mean(axis=3)                          # (N, h, w)
+        spread = lum.max(axis=0) - lum.min(axis=0)        # per-pixel temporal range
+        mask = (spread > _DECARET_DIFF_THRESH).astype(np.uint8)
+        changed = int(mask.sum())
+        if changed == 0:
+            return ref
+        ring_k = np.ones((2 * _DECARET_RING_PX + 1, 2 * _DECARET_RING_PX + 1), np.uint8)
+        n_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+        out = arrs[0].copy()
+        for lbl in range(1, n_labels):
+            region = labels == lbl
+            # Shape-following ring just outside the region; never sample another
+            # changed pixel (mask == 0), so a nearby blinker can't bias the colour.
+            ring = (cv2.dilate(region.astype(np.uint8), ring_k) > 0) & (mask == 0)
+            if not ring.any():
+                continue
+            ref_color = np.median(stack[0][ring], axis=0)   # surrounding field colour
+            best = min(
+                range(len(arrs)),
+                key=lambda f, _r=region, _c=ref_color: float(
+                    np.abs(np.median(stack[f][_r], axis=0) - _c).sum()
+                ),
+            )
+            out[region] = arrs[best][region]                # copy the caret-off frame's real pixels
+        log.info("decaret: healed %d changed px in %d region(s) across %d frames",
+                 changed, n_labels - 1, len(frames))
+        return Image.fromarray(out)
+    except Exception as exc:
+        log.warning("_decaret failed (%s: %s) — using raw frame.", type(exc).__name__, exc)
+        return ref
 
 
 # --- Image annotation ------------------------------------------------------ #
@@ -2360,16 +2468,25 @@ class ComputerAgent:
 
     # --- screen parsing --------------------------------------------------- #
 
-    def _parse_screen(self) -> Tuple[str, List[Element], ChangeSet]:
+    def _parse_screen(self, decaret: bool = False) -> Tuple[str, List[Element], ChangeSet]:
         """
         Capture foreground window, run OCR, reconcile IDs, ANNOTATE the image
         (boxes + IDs + crosshair at last-click), return (base64 of annotated
         image, elements, change-set-vs-previous-frame).
+
+        When *decaret* is True, capture a short burst of frames and remove the
+        blinking text caret before OCR (see _decaret) — used after actions that
+        focus/edit a field, where the caret corrupts field text OCR.
         """
         t0 = time.monotonic()
-        screenshot, (win_x, win_y, win_w, win_h) = capture_foreground()
-        log.info("screenshot: %.2fs (window %dx%d at %d,%d)",
-                 time.monotonic() - t0, win_w, win_h, win_x, win_y)
+        if decaret:
+            frames, (win_x, win_y, win_w, win_h) = capture_foreground_burst()
+            screenshot = _decaret(frames)
+        else:
+            screenshot, (win_x, win_y, win_w, win_h) = capture_foreground()
+        log.info("screenshot: %.2fs (window %dx%d at %d,%d)%s",
+                 time.monotonic() - t0, win_w, win_h, win_x, win_y,
+                 " [decaret]" if decaret else "")
 
         t1 = time.monotonic()
         log.info("Starting OCR + icon detection (parallel) ...")
@@ -2920,10 +3037,12 @@ class ComputerAgent:
             if task_done:
                 break
 
-            # Observe new screen state.
+            # Observe new screen state. If an action this turn focused or edited
+            # a field, a text caret is likely — remove it before OCR (decaret).
             time.sleep(0.2)
             self.executor.tick_click_age()
-            screenshot_b64, elements, change = self._parse_screen()
+            did_edit = any(a in _CARET_INDUCING_ACTIONS for a, _, _ in iteration_actions)
+            screenshot_b64, elements, change = self._parse_screen(decaret=did_edit)
             log.info("[CHANGE] %s", change.summary())
             new_sig = ocr_signature(elements)
             screen_changed = new_sig != self._last_ocr_signature
@@ -3058,7 +3177,9 @@ class ComputerAgent:
         log.info("Verifying completion: %s", claim)
         time.sleep(0.1)
         self.executor.tick_click_age()
-        screenshot_b64, elements, change = self._parse_screen()
+        # Evidence is typically a value typed into a still-focused field, so the
+        # caret is likely present — remove it before the OCR evidence re-check.
+        screenshot_b64, elements, change = self._parse_screen(decaret=True)
 
         # Re-check actor's evidence against the fresh OCR.
         evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
