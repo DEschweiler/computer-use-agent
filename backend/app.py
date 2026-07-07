@@ -31,6 +31,25 @@ agent_process = None
 _agent_lock = threading.Lock()
 
 
+def _temp_dir():
+    return os.environ.get('TEMP', '/tmp')
+
+
+def _clear_conversation(delete_screenshot=True):
+    """Delete the persisted conversation context (and optionally the last
+    screenshot). Used on startup (always fresh) and by /api/reset."""
+    paths = [os.path.join(_temp_dir(), 'agent_session.json')]
+    if delete_screenshot:
+        paths.append(os.path.join(_temp_dir(), 'agent_screenshot_debug.png'))
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"[API] Could not remove {p}: {exc}")
+
+
 
 
 def run_agent_task_proc(task, log_queue):
@@ -69,6 +88,9 @@ def run_agent_task_proc(task, log_queue):
         actions = result["actions"]
         # Check if the run ended with an abort
         aborted = actions and actions[-1].get("error", "").startswith("aborted")
+        # A clarifying question ends the run and awaits the user's reply; it
+        # takes precedence over any answer text.
+        question = result.get("question")
         # Extract the final answer from the last verified task_complete action
         final_answer = None
         for action in reversed(actions):
@@ -78,6 +100,8 @@ def run_agent_task_proc(task, log_queue):
         log_queue.put(f"[SYSTEM] Task completed with {len(actions)} actions\n")
         if aborted:
             log_queue.put("[ABORTED]\n")
+        elif question:
+            log_queue.put(f"[QUESTION] {question}\n")
         elif final_answer:
             log_queue.put(f"[ANSWER] {final_answer}\n")
         log_queue.put("[DONE]")
@@ -102,6 +126,16 @@ def start_task():
         # Clear the queue
         while not log_queue.empty():
             log_queue.get()
+
+        # Delete the previous run's debug screenshot immediately, so the UI shows
+        # "waiting" instead of a stale frame until the agent writes a fresh one.
+        stale_shot = os.path.join(os.environ.get('TEMP', '/tmp'), 'agent_screenshot_debug.png')
+        try:
+            os.remove(stale_shot)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"[API] Could not remove stale screenshot: {exc}")
 
         global agent_process
         if agent_process is not None and agent_process.is_alive():
@@ -142,6 +176,23 @@ def stop_task():
         log_queue.put("[SYSTEM] No agent process running.\n")
         log_queue.put("[DONE]")
         return jsonify({'status': 'not_running'})
+
+
+@app.route('/api/reset', methods=['POST'])
+def reset_conversation():
+    """Start a fresh conversation during usage: stop any running task and wipe
+    the persisted context + last screenshot. (Startup is always fresh already.)"""
+    global agent_process
+    with _agent_lock:
+        if agent_process is not None and agent_process.is_alive():
+            agent_process.terminate()
+            agent_process.join(timeout=2)
+            agent_process = None
+        _clear_conversation(delete_screenshot=True)
+        while not log_queue.empty():
+            log_queue.get()
+    print("[API] Conversation reset — context and screenshot cleared.")
+    return jsonify({'status': 'reset'})
 
 
 @app.route('/api/screenshot')
@@ -223,6 +274,8 @@ def info():
 
 
 if __name__ == '__main__':
+    # Startup is always a fresh conversation.
+    _clear_conversation(delete_screenshot=True)
     print("\n" + "="*60)
     print("🤖 Computer Use Agent - Backend Started")
     print("="*60)

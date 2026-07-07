@@ -52,7 +52,7 @@ import tempfile
 import time
 import urllib3
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -466,6 +466,46 @@ COMPUTER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "open_application",
+            "description": (
+                "Launch an application by name via the Windows Start menu (opens Start, types "
+                "the name, presses Enter), then brings it to the foreground. Use this when the "
+                "application you need is NOT listed by list_windows. After launching, confirm "
+                "the correct window is focused before acting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Application name to search for and launch, e.g. 'HospitalRun', 'Notepad'."},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["name", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user a clarifying question and stop. Use ONLY when you genuinely cannot "
+                "determine which application or target the request refers to and no reasonable "
+                "default exists. Ends the current run; the user's reply continues this same "
+                "conversation, so you will not lose progress or repeat completed work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "A specific, concrete question for the user."},
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["question", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calculate",
             "description": (
                 "Integer addition/subtraction for deriving pixel coordinates (e.g. the "
@@ -653,6 +693,62 @@ NAVIGATOR_TOOLS = [
 ]
 
 
+# --- Narrator (on-demand visual observer) ---------------------------------- #
+#
+# The deterministic change-set is blind to visual-only state (a button greying
+# out, a spinner, a red validation border, a selected row) because those move no
+# element and change no text. The narrator is a VLM call — EXPENSIVE, so invoked
+# only when the cheap signals are insufficient: an ambiguous transition (popup /
+# screen-replaced) or a stuck run. It is GROUNDED in the deterministic diff to
+# curb hallucination, and it stays goal-agnostic (describe, don't advise) — the
+# navigator does the goal reasoning.
+
+NARRATOR_SYSTEM_PROMPT = """\
+You are the OBSERVER for a computer-use agent. You are shown the current \
+screenshot and a deterministic list of element changes since the last action \
+(ground truth). Describe, in 1-3 concrete sentences, WHAT CHANGED on screen — \
+paying special attention to VISUAL or STATE changes the element list cannot \
+capture: a button becoming enabled/disabled or greyed out, a spinner or progress \
+indicator, a row becoming selected/highlighted, a red/coloured validation border, \
+a checkbox or toggle flipping, a colour change, a dialog overlaying the page.
+
+Rules:
+  - Describe only what is actually visible. If nothing beyond the listed element \
+changes is apparent, say so briefly.
+  - Do NOT give instructions or judge progress — only report observations.
+  - Be specific about location ("the Save button, bottom-right") so the actioner \
+can act on it.
+"""
+
+NARRATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "describe",
+            "description": "Report what visibly changed on screen since the last action.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "1-3 sentences describing what changed on screen.",
+                    },
+                    "visual_state_changes": {
+                        "type": "string",
+                        "description": (
+                            "Visual/state changes NOT captured by the element diff "
+                            "(disabled/greyed button, spinner, highlight, validation "
+                            "colour, etc.), or empty if none."
+                        ),
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
+
 # --- DPI awareness --------------------------------------------------------- #
 
 def _enable_dpi_awareness() -> None:
@@ -787,6 +883,27 @@ class ChangeSet:
         if not lines:
             return "SINCE YOUR LAST ACTION: no visible change on screen."
         return "SINCE YOUR LAST ACTION:\n  " + "\n  ".join(lines)
+
+    def summary(self) -> str:
+        """Compact single-line summary — safe for the (newline-delimited) log/SSE stream."""
+        if self.transition == "replaced":
+            return f"screen replaced ({len(self.disappeared)} gone, {len(self.appeared)} new)"
+        if self.transition == "scroll":
+            d = "down" if self.scroll_dy < 0 else "up"
+            return f"scrolled {d} ~{abs(self.scroll_dy)}px ({len(self.appeared)} newly visible)"
+        if self.is_empty:
+            return "no visible change"
+        parts = []
+        if self.text_changed:
+            parts.append(f"{len(self.text_changed)} changed")
+        if self.appeared:
+            parts.append(f"{len(self.appeared)} appeared")
+        if self.disappeared:
+            parts.append(f"{len(self.disappeared)} disappeared")
+        if self.moved:
+            parts.append(f"{len(self.moved)} moved")
+        prefix = "popup + " if self.transition == "popup" else ""
+        return prefix + ", ".join(parts)
 
 
 class ElementRegistry:
@@ -1234,6 +1351,66 @@ def _get_font(size: int = 11) -> Optional[ImageFont.ImageFont]:
         return None
 
 
+def _diff_regions(
+    prev: "Image.Image",
+    cur: "Image.Image",
+    cell: int = 24,
+    pixel_thresh: int = 28,
+    min_cell_frac: float = 0.06,
+    max_regions: int = 12,
+) -> List[Tuple[int, int, int, int]]:
+    """Coarse pixel-diff between two same-size frames → changed-region rectangles.
+
+    Grayscale abs-diff is thresholded, pooled into a cell grid, and adjacent
+    changed cells are merged (4-neighbour connected components). Returns up to
+    `max_regions` (x, y, w, h) boxes in image coords, largest first. Full-frame
+    regions (>60% area — i.e. the whole screen changed) are dropped; the caller
+    already skips this entirely on scroll/replaced transitions.
+    """
+    if prev.size != cur.size:
+        return []
+    a = np.asarray(prev.convert("L"), dtype=np.int16)
+    b = np.asarray(cur.convert("L"), dtype=np.int16)
+    diff = np.abs(a - b) > pixel_thresh          # bool HxW
+    if not diff.any():
+        return []
+    H, W = diff.shape
+    gh, gw = (H + cell - 1) // cell, (W + cell - 1) // cell
+    padded = np.zeros((gh * cell, gw * cell), dtype=np.int32)
+    padded[:H, :W] = diff
+    counts = padded.reshape(gh, cell, gw, cell).sum(axis=(1, 3))
+    grid = counts >= int(cell * cell * min_cell_frac)
+
+    visited = np.zeros_like(grid)
+    regions: List[Tuple[int, int, int, int, int]] = []
+    for cy in range(gh):
+        for cx in range(gw):
+            if not grid[cy, cx] or visited[cy, cx]:
+                continue
+            stack = [(cy, cx)]
+            visited[cy, cx] = True
+            minx = maxx = cx
+            miny = maxy = cy
+            while stack:
+                yy, xx = stack.pop()
+                minx, maxx = min(minx, xx), max(maxx, xx)
+                miny, maxy = min(miny, yy), max(maxy, yy)
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = yy + dy, xx + dx
+                    if 0 <= ny < gh and 0 <= nx < gw and grid[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            rx, ry = minx * cell, miny * cell
+            rw = min((maxx + 1) * cell, W) - rx
+            rh = min((maxy + 1) * cell, H) - ry
+            area = rw * rh
+            if area > 0.6 * W * H:      # whole-screen change — not a useful highlight
+                continue
+            regions.append((rx, ry, rw, rh, area))
+    regions.sort(key=lambda r: -r[4])
+    return [(x, y, w, h) for (x, y, w, h, _) in regions[:max_regions]]
+
+
 def annotate_screenshot(
     screenshot: Image.Image,
     elements: List[Element],
@@ -1241,16 +1418,30 @@ def annotate_screenshot(
     win_y: int,
     click_marker: Optional[Tuple[int, int]] = None,
     max_label_elements: int = 120,
+    highlight_regions: Optional[List[Tuple[int, int, int, int]]] = None,
 ) -> Image.Image:
     """
     Draw OCR bounding boxes + stable IDs onto the screenshot, and optionally
     a crosshair at click_marker (screen-absolute coords).
+
+    highlight_regions: image-relative (x, y, w, h) rectangles marking pixels that
+    changed since the previous frame (from the pixel-diff). Drawn UNDER the
+    element boxes as a translucent magenta wash so the model's eye is pulled to
+    "what just changed" — catching visual-state changes OCR/YOLO cannot see
+    (a button greying out, a spinner, a red validation border).
 
     Returns a new RGB image. Input is not modified.
     """
     out = screenshot.convert("RGB").copy()
     draw = ImageDraw.Draw(out, "RGBA")
     font = _get_font(11)
+
+    # Change-highlight wash first, so element boxes/labels stay legible on top.
+    for (rx, ry, rw, rh) in (highlight_regions or []):
+        draw.rectangle([rx, ry, rx + rw, ry + rh], fill=(255, 0, 200, 40),
+                       outline=(255, 0, 200, 230), width=2)
+        if font is not None:
+            draw.text((rx + 2, max(0, ry - 12)), "Δ changed", fill=(255, 120, 220), font=font)
 
     # Sort elements by confidence; label only the top N to avoid visual clutter
     # on very dense screens. Low-confidence elements still get a faint box.
@@ -1320,6 +1511,15 @@ _KEY_MAP = {
     "delete": "del",
 }
 
+# Actions that manipulate the focused window and must NOT run until an
+# application has been deliberately brought to the foreground this run.
+# focus_window / open_application / list_windows / calculate / wait are exempt
+# (they are how you *reach* a focused state, or are side-effect free).
+_FOCUS_REQUIRED_ACTIONS = frozenset({
+    "click", "double_click", "click_and_type", "type", "type_text",
+    "keypress", "scroll", "delete_chars",
+})
+
 
 class ActionExecutor:
     """Pure input dispatcher. No knowledge of screens or LLMs."""
@@ -1330,6 +1530,12 @@ class ActionExecutor:
         self.registry = registry
         self.last_click_point: Optional[Tuple[int, int]] = None
         self.last_click_age: int = 0  # iterations since last click, for marker fade
+        # Window-focus gating + persistence. `focused_once` guards input actions
+        # until a focus has succeeded this run; `target_window` is the substring
+        # of the last successfully-focused window, persisted across follow-up
+        # requests in the same conversation (see save_session/load_session).
+        self.focused_once: bool = False
+        self.target_window: Optional[str] = None
         pyautogui.FAILSAFE = False
         pyautogui.PAUSE = 0.0
 
@@ -1355,6 +1561,23 @@ class ActionExecutor:
 
     def execute(self, action_type: str, args: Dict[str, Any]) -> str:
         try:
+            # Gate: never touch the screen until a target application has been
+            # deliberately focused this run. Prevents acting on whatever window
+            # happened to be frontmost (e.g. the agent's own UI).
+            if action_type in _FOCUS_REQUIRED_ACTIONS and not self.focused_once:
+                return (
+                    "error: no application focused yet. Before any click/type/scroll you MUST "
+                    "bring the target application to the foreground — call focus_window (use "
+                    "list_windows first to see exact titles), or open_application if it is not "
+                    "running. Derive which application from the user's request."
+                )
+
+            if action_type == "open_application":
+                name = args.get("name", "")
+                if not name:
+                    return "error: no application name provided"
+                return self._open_application(name)
+
             if action_type in ("click", "double_click"):
                 point, err = self._resolve_point(args)
                 if point is None:
@@ -1484,8 +1707,7 @@ class ActionExecutor:
             return "(no visible windows found)"
         return "Visible windows:\n" + "\n".join(f"  - {t}" for t in titles)
 
-    @staticmethod
-    def _focus_window(title_substr: str) -> str:
+    def _focus_window(self, title_substr: str) -> str:
         if platform.system() != "Windows":
             return "error: focus_window is only supported on Windows"
         import ctypes
@@ -1518,7 +1740,33 @@ class ActionExecutor:
         length = user32.GetWindowTextLengthW(target_hwnd)
         buf = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(target_hwnd, buf, length + 1)
+        # Record the focus so input actions are unblocked and the target
+        # persists across follow-up requests in this conversation.
+        self.focused_once = True
+        self.target_window = title_substr
         return f"focused '{buf.value}'"
+
+    def _open_application(self, name: str) -> str:
+        """Launch an app by name via the Start menu (Win → type → Enter), then
+        bring its window to the foreground. Returns a human-readable result."""
+        if platform.system() != "Windows":
+            return "error: open_application is only supported on Windows"
+        pyautogui.press("win")
+        time.sleep(0.6)
+        pyautogui.write(name, interval=0.03)
+        time.sleep(0.8)
+        pyautogui.press("enter")
+        # The app can take a few seconds to spawn its window; poll and focus.
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            time.sleep(1.0)
+            res = self._focus_window(name)  # sets focused_once/target_window on success
+            if not res.startswith("error"):
+                return f"launched '{name}' and {res}"
+        return (
+            f"launched '{name}' via the Start menu, but no window matching it appeared yet. "
+            "Call wait() then focus_window, or list_windows to check the exact title."
+        )
 
 
 # --- Progress trail (model-thought-driven) -------------------------------- #
@@ -1551,6 +1799,18 @@ class ProgressTrail:
 
     def entries(self) -> List[TrailEntry]:
         return list(self._entries)
+
+    def export(self) -> List[Dict[str, Any]]:
+        """Serialize entries for session persistence."""
+        return [asdict(e) for e in self._entries]
+
+    def load(self, entries: List[Dict[str, Any]]) -> None:
+        """Restore entries from a persisted session (appends to current)."""
+        for d in entries:
+            try:
+                self._entries.append(TrailEntry(**d))
+            except TypeError:
+                continue  # tolerate schema drift across versions
 
     def render(self) -> str:
         if not self._entries:
@@ -1907,8 +2167,16 @@ REASONING PATTERN — for every action, include a 'thought' that covers:
 Keep it under 50 words. This is how you remember your plan and notice mistakes.
 
 RULES:
-- At the start of every task, call list_windows then focus_window to bring the \
-  correct application to the foreground before taking any other action.
+- FIRST ACTION, ALWAYS: bring the correct application to the foreground before \
+  any click/type/keypress/scroll. Derive WHICH application from the user's \
+  request. Call focus_window (call list_windows first if you need the exact \
+  titles). Input actions are BLOCKED by the executor until a window has been \
+  focused this run — a focus is not optional. \
+  - If the target application is not open (not in list_windows), call \
+    open_application(name) to launch it, then continue. \
+  - If it is genuinely unclear which application the request refers to and no \
+    reasonable default exists, call ask_user(question) with a specific question \
+    and stop; the user's reply continues this same conversation.
 - Prefer element_id over raw x/y. Coordinates are screen-absolute. \
   If you must use raw x/y, always derive them from the @(cx,cy) values in the \
   current element list — it should always be in pixel coordinates, not in ratios. Use the \
@@ -1982,6 +2250,14 @@ class AgentConfig:
     # plain ReAct loop.
     use_navigator: bool = True
     navigator_max_tokens: int = 400
+    # Narrator (on-demand VLM observer). Invoked only on ambiguous transitions
+    # or when stuck, to catch visual-state changes the element diff misses.
+    # Set NARRATOR=0 to disable. Requires the navigator.
+    use_narrator: bool = True
+    # Session continuity: when True, each run() loads the prior task's trail +
+    # task list from the session file and continues the conversation, saving
+    # again at the end. Startup and the "New conversation" control clear it.
+    continue_session: bool = True
 
 
 @dataclass
@@ -1993,6 +2269,8 @@ class NavigatorState:
     last_reasoning: str = ""
     guidance: str = ""                # tactical hint injected into the actioner's note
     stuck_rounds: int = 0             # consecutive navigator 'stuck'/'off_track' verdicts
+    last_narration: str = ""          # most recent narrator observation, fed to the next assessment
+    prior_tasks: List[str] = field(default_factory=list)  # earlier requests in this conversation
 
     def render_for_actioner(self) -> str:
         """The block prepended to the actioner's observation each step."""
@@ -2000,6 +2278,57 @@ class NavigatorState:
         if self.guidance:
             lines.append(f"NAVIGATOR GUIDANCE: {self.guidance}")
         return "\n".join(lines)
+
+
+# --- Session persistence (conversation continuity) ------------------------- #
+#
+# A conversation is a sequence of user requests that share context. Because the
+# backend runs each task in a fresh subprocess, continuity is carried on disk:
+# the effective context the model sees each step is the ProgressTrail (always
+# re-injected into the latest observation), so persisting the trail + the task
+# list is enough to "continue the whole conversation". Startup and the in-app
+# "New conversation" control call clear_session().
+
+def _temp_dir() -> Path:
+    return Path(os.environ.get("TEMP", tempfile.gettempdir()))
+
+
+def _session_path() -> Path:
+    return _temp_dir() / "agent_session.json"
+
+
+def _debug_screenshot_path() -> Path:
+    return _temp_dir() / "agent_screenshot_debug.png"
+
+
+def load_session() -> Dict[str, Any]:
+    """Return the persisted session dict, or {} if none / unreadable."""
+    try:
+        return json.loads(_session_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_session(data: Dict[str, Any]) -> None:
+    try:
+        _session_path().write_text(json.dumps(data), encoding="utf-8")
+    except Exception as exc:
+        log.debug("session save failed: %s", exc)
+
+
+def clear_session() -> None:
+    """Wipe conversation context and the last annotated screenshot.
+
+    Called on startup (always a fresh conversation) and by the in-app
+    'New conversation' control during usage.
+    """
+    for p in (_session_path(), _debug_screenshot_path()):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.debug("clear_session: could not remove %s (%s)", p, exc)
 
 
 class ComputerAgent:
@@ -2027,6 +2356,7 @@ class ComputerAgent:
         self._last_ocr_signature: Optional[frozenset] = None
         self._no_change_streak = 0
         self._last_action_was_wait = False
+        self._prev_screenshot: Optional[Image.Image] = None  # raw frame, for pixel-diff highlight
 
     # --- screen parsing --------------------------------------------------- #
 
@@ -2080,10 +2410,22 @@ class ComputerAgent:
 
         reconciled, change = self.registry.reconcile(merged, self.width, self.height)
 
+        # Pixel-diff highlight: mark what changed since the previous frame — but
+        # skip on scroll/replaced, where "everything" changed and a wash is noise.
+        highlight_regions: List[Tuple[int, int, int, int]] = []
+        if (self._prev_screenshot is not None
+                and change.transition not in ("scroll", "replaced")):
+            try:
+                highlight_regions = _diff_regions(self._prev_screenshot, screenshot)
+            except Exception as exc:
+                log.debug("pixel-diff highlight failed: %s", exc)
+        self._prev_screenshot = screenshot  # raw frame for the next diff
+
         # Annotate — same image for LLM and for the debug screenshot file.
         annotated = annotate_screenshot(
             screenshot, reconciled, win_x, win_y,
             click_marker=self.executor.last_click_point,
+            highlight_regions=highlight_regions,
         )
 
         if self.cfg.save_debug_screenshots:
@@ -2226,14 +2568,26 @@ class ComputerAgent:
         in its own short context (not the actioner's history) — cheap, and the
         separation is what gives the 'neutral outside view'. Never executes input.
         """
+        narration_block = (
+            f"VISUAL OBSERVATION (from the narrator): {nav.last_narration}\n\n"
+            if nav.last_narration else ""
+        )
+        prior_block = (
+            f"EARLIER REQUESTS IN THIS CONVERSATION (already handled): "
+            f"{'; '.join(nav.prior_tasks)}\n"
+            if nav.prior_tasks else ""
+        )
         user = (
-            f"ULTIMATE GOAL: {nav.ultimate_goal}\n"
+            f"{prior_block}"
+            f"ULTIMATE GOAL (current request): {nav.ultimate_goal}\n"
             f"CURRENT OBJECTIVE: {nav.current_intent or '(none yet — set the first objective)'}\n\n"
             f"{change.render()}\n\n"
+            f"{narration_block}"
             f"{trail.render() or 'PROGRESS SO FAR: (nothing done yet)'}\n\n"
             f"CURRENT SCREEN ELEMENTS:\n{elements_text}\n\n"
             "Assess progress toward the ULTIMATE GOAL and set the next objective."
         )
+        nav.last_narration = ""  # consumed — don't carry a stale narration forward
         messages = [
             {"role": "system", "content": NAVIGATOR_SYSTEM_PROMPT},
             {"role": "user", "content": user},
@@ -2281,6 +2635,53 @@ class ComputerAgent:
         log.info("[NAV] %s | %s", nav.last_status or "?", nav.last_reasoning)
         log.info("[NAV] → objective: %s", nav.current_intent)
 
+    def _narrate(self, screenshot_b64: str, change: ChangeSet, tokens: Dict[str, int]) -> str:
+        """On-demand VLM observer: describe visual/state changes the deterministic
+        diff misses (greyed button, spinner, validation colour). Grounded in the
+        change-set to curb hallucination. Returns a short string, or "" on failure.
+        """
+        user_content = [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+            {"type": "text", "text": (
+                "Deterministic element diff since the last action (ground truth):\n"
+                f"{change.render()}\n\n"
+                "Describe what changed on the screen, especially visual/state changes "
+                "not captured above. Call `describe` once."
+            )},
+        ]
+        messages = [
+            {"role": "system", "content": NARRATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        try:
+            resp = self._call_llm(
+                messages, tools=NARRATOR_TOOLS, max_tokens=self.cfg.navigator_max_tokens
+            )
+        except Exception as exc:
+            log.warning("Narrator call failed (%s).", exc)
+            return ""
+
+        tokens["calls"] += 1
+        if "usage" in resp:
+            u = resp["usage"]
+            tokens["input"] += u.get("prompt_tokens", 0)
+            tokens["output"] += u.get("completion_tokens", 0)
+            tokens["total"] += u.get("total_tokens", 0)
+
+        msg = resp["choices"][0]["message"]
+        tcs = msg.get("tool_calls") or []
+        if not tcs:
+            return (msg.get("content") or "").strip()
+        try:
+            args = json.loads(tcs[0]["function"]["arguments"] or "{}")
+        except json.JSONDecodeError:
+            return ""
+        summary = (args.get("summary") or "").strip()
+        visual = (args.get("visual_state_changes") or "").strip()
+        if visual and visual.lower() not in ("none", "n/a", ""):
+            return (summary + f" [visual: {visual}]").strip()
+        return summary
+
     # --- main loop -------------------------------------------------------- #
 
     def run(self, instruction: str) -> Dict[str, Any]:
@@ -2290,12 +2691,34 @@ class ComputerAgent:
         log.info("TASK: %s", instruction)
         log.info("=" * 70)
 
-        # Reset per-task state.
+        # Reset per-run state (registry/executor are per-process anyway).
         self._no_change_streak = 0
         self._last_ocr_signature = None
         self._last_action_was_wait = False
+        self._prev_screenshot = None
         self.registry = ElementRegistry()
         self.executor = ActionExecutor(self.width, self.height, self.registry)
+
+        # Load prior conversation context for continuity (empty on a fresh
+        # conversation — startup and "New conversation" clear the session file).
+        session = load_session() if self.cfg.continue_session else {}
+        prior_tasks: List[str] = session.get("tasks", [])
+        continuing = bool(prior_tasks)
+        iter_base = int(session.get("last_iteration", 0))
+        if continuing:
+            log.info("Continuing conversation: %d earlier request(s), %d trail entries carried.",
+                     len(prior_tasks), len(session.get("trail", [])))
+
+        # Deterministic focus BEFORE the first frame: on a continued conversation,
+        # re-focus the window this conversation was already driving so the first
+        # screenshot — and the navigator's first objective — are grounded in the
+        # real application, not whatever happened to be frontmost (the browser UI).
+        # On a fresh conversation there is no target yet; the executor's focus gate
+        # then forces the model to focus/open the right app as its first action.
+        target_window = session.get("target_window")
+        if target_window:
+            res = self.executor._focus_window(target_window)
+            log.info("[FOCUS] startup re-focus of %r → %s", target_window, res)
 
         screenshot_b64, elements, _ = self._parse_screen()  # first frame: no change-set
         elements_text = self._format_elements(elements)
@@ -2310,17 +2733,45 @@ class ComputerAgent:
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
         trail = ProgressTrail()
+        trail.load(session.get("trail", []))  # continuity: prior actions/thoughts/outcomes
         nudge_count = 0
+        pending_question: Optional[str] = None  # set if the model calls ask_user
 
         # Navigator: set the first objective from the goal + the current screen,
         # then prepend it to the actioner's first observation.
         nav: Optional[NavigatorState] = None
         if self.cfg.use_navigator:
-            nav = NavigatorState(ultimate_goal=instruction)
-            self._navigate(nav, ChangeSet(), trail, elements_text, tokens)
+            nav = NavigatorState(ultimate_goal=instruction, prior_tasks=prior_tasks)
+            if self.executor.focused_once:
+                # Grounded in the real app (continued conversation, or a startup
+                # re-focus succeeded): let the navigator set the first objective
+                # from the actual screen.
+                self._navigate(nav, ChangeSet(), trail, elements_text, tokens)
+            else:
+                # Fresh conversation: the first frame is pre-focus (often the
+                # agent's own UI), so the navigator would fabricate a bogus
+                # objective like "click [e1]". Seed a fixed focus-first objective
+                # instead; the navigator re-assesses in-loop once the correct
+                # application is focused.
+                nav.current_intent = (
+                    "Bring the correct application for this request to the foreground FIRST "
+                    "(focus_window, or open_application if it is not running). If it is unclear "
+                    "which application the request refers to, ask_user. Do not click or type "
+                    "until the right application is focused."
+                )
             initial_text = nav.render_for_actioner() + "\n\n" + elements_text
         else:
             initial_text = elements_text
+
+        # On a continued conversation, front-load the memory so the actioner
+        # knows it is mid-conversation and sees everything it already did.
+        if continuing:
+            prior = "; ".join(prior_tasks)
+            initial_text = (
+                f"(CONTINUING CONVERSATION. Earlier requests you already handled: {prior}. "
+                f"The screen is where that work left off; your full action history is below.)\n\n"
+                f"{trail.render()}\n\n" + initial_text
+            )
         history.add_initial_user(instruction, initial_text, screenshot_b64)
 
         for iteration in range(self.cfg.max_iterations):
@@ -2429,6 +2880,20 @@ class ComputerAgent:
                         task_done = True
                     break
 
+                if fn_name == "ask_user":
+                    question = (args.get("question") or "").strip()
+                    log.info("[QUESTION] %s", question)
+                    history.add_tool_result(tc["id"], "asked the user; ending run to await their reply.")
+                    actions_log.append({
+                        "iteration": iteration + 1,
+                        "action": "ask_user",
+                        "question": question,
+                        "thought": thought,
+                    })
+                    pending_question = question
+                    task_done = True  # end the run; the user's reply continues this conversation
+                    break
+
                 action_type = "type" if fn_name == "type_text" else fn_name
                 # Strip 'thought' before handing args to the executor.
                 exec_args = {k: v for k, v in args.items() if k != "thought"}
@@ -2459,6 +2924,7 @@ class ComputerAgent:
             time.sleep(0.2)
             self.executor.tick_click_age()
             screenshot_b64, elements, change = self._parse_screen()
+            log.info("[CHANGE] %s", change.summary())
             new_sig = ocr_signature(elements)
             screen_changed = new_sig != self._last_ocr_signature
             self._last_ocr_signature = new_sig
@@ -2485,7 +2951,7 @@ class ComputerAgent:
                              if line.strip().startswith("-")]
                     trail_result = f"{len(found)} windows: {'; '.join(found)}"
                 trail.record(TrailEntry(
-                    iteration=iteration + 1,
+                    iteration=iter_base + iteration + 1,
                     action=fn_name,
                     target_key=target_key_from_args(fn_name, args),
                     thought=thought,
@@ -2496,6 +2962,17 @@ class ComputerAgent:
 
             elements_text = self._format_elements(elements)
 
+            # Narrator (expensive VLM) only when the cheap signals are insufficient:
+            # an ambiguous transition (popup/replaced) or an ongoing stuck run. Runs
+            # BEFORE the navigator so the navigator gets 'eyes' on the hard screen.
+            narration = ""
+            if (nav is not None and self.cfg.use_narrator
+                    and (change.transition in ("popup", "replaced") or nav.stuck_rounds >= 2)):
+                narration = self._narrate(screenshot_b64, change, tokens)
+                if narration:
+                    log.info("[NARRATOR] %s", narration)
+                    nav.last_narration = narration  # consumed by the navigator below
+
             # Navigator re-assesses progress toward the goal (text-only, cheap) and
             # updates the objective/guidance the actioner sees next.
             if nav is not None:
@@ -2503,11 +2980,14 @@ class ComputerAgent:
 
             # Build the next observation note: navigator objective first (the
             # steering signal), then the change-set (what the last action caused),
-            # then the full trail, then thrashing/stuck warnings.
+            # then any narrator observation, then the full trail and warnings.
             note_parts: List[str] = []
             if nav is not None:
                 note_parts.append(nav.render_for_actioner())
-            note_parts.extend([change.render(), trail.render()])
+            note_parts.append(change.render())
+            if narration:
+                note_parts.append("VISUAL OBSERVATION (narrator): " + narration)
+            note_parts.append(trail.render())
             thrash = trail.thrashing_warning()
             if thrash:
                 log.warning(thrash)
@@ -2535,11 +3015,25 @@ class ComputerAgent:
                  tokens["input"], tokens["output"], tokens["total"])
         log.info("=" * 70)
 
+        # Persist the conversation so the next request continues from here.
+        if self.cfg.continue_session:
+            entries = trail.entries()
+            save_session({
+                "tasks": prior_tasks + [instruction],
+                "trail": trail.export(),
+                "last_iteration": entries[-1].iteration if entries else iter_base,
+                # Persist the focused app so follow-up requests re-focus it
+                # deterministically. Falls back to the prior value if this run
+                # never (re-)focused. Wiped by clear_session on 'New conversation'.
+                "target_window": self.executor.target_window or session.get("target_window"),
+            })
+
         return {
             "started_at": start_dt.isoformat(),
             "duration_seconds": duration,
             "actions": actions_log,
             "tokens": tokens,
+            "question": pending_question,  # non-None if the run ended on ask_user
         }
 
     # --- completion verification ----------------------------------------- #
@@ -2663,8 +3157,12 @@ def _load_config() -> AgentConfig:
             "(or LLM_ENDPOINT / LLM_MODEL) in your .env file."
         )
     use_navigator = os.getenv("NAVIGATOR", "1").strip().lower() not in ("0", "false", "no", "off")
+    use_narrator = os.getenv("NARRATOR", "1").strip().lower() not in ("0", "false", "no", "off")
+    continue_session = os.getenv("CONTINUE_SESSION", "1").strip().lower() not in ("0", "false", "no", "off")
     return AgentConfig(
-        endpoint=endpoint, api_key=api_key, model=model, use_navigator=use_navigator
+        endpoint=endpoint, api_key=api_key, model=model,
+        use_navigator=use_navigator, use_narrator=use_narrator,
+        continue_session=continue_session,
     )
 
 
@@ -2672,7 +3170,7 @@ def interactive(agent: ComputerAgent) -> None:
     print("\n" + "=" * 72)
     print("COMPUTER AGENT")
     print("=" * 72)
-    print("Type an instruction, or 'quit' to exit.\n")
+    print("Type an instruction, 'new' to start a fresh conversation, or 'quit' to exit.\n")
     while True:
         try:
             instr = input("task > ").strip()
@@ -2683,6 +3181,10 @@ def interactive(agent: ComputerAgent) -> None:
             continue
         if instr.lower() in {"quit", "exit", "q"}:
             break
+        if instr.lower() in {"new", "reset"}:
+            clear_session()
+            print("Started a fresh conversation (context and last screenshot cleared).")
+            continue
         try:
             agent.run(instr)
         except Exception:
@@ -2692,6 +3194,7 @@ def interactive(agent: ComputerAgent) -> None:
 def main() -> None:
     cfg = _load_config()
     log.info("Profile endpoint: %s | model: %s", cfg.endpoint, cfg.model)
+    clear_session()  # startup is always a fresh conversation
     agent = ComputerAgent(cfg)
     interactive(agent)
 
