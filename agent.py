@@ -7,6 +7,21 @@ generalist navigation of native Windows apps and Citrix-hosted remote apps
 where no structural UI tree is available.
 
 Design notes (differences from the previous version):
+  * HIERARCHICAL supervisor/actioner split. The SUPERVISOR owns a dynamically
+    growing todo list (Plan/TodoItem) and is the outer control loop: it is
+    called at sub-task BOUNDARIES (item done/blocked, budget exhausted) and on
+    ALARMS (wrong-field mutation, stuck screen) — not after every action. The
+    ACTIONER is a bounded subroutine that only ever sees the SINGLE current
+    item (never the user's full request): information asymmetry is what makes
+    the hierarchy real.
+  * Machine-verified progress: item ticks and final completion require OCR
+    evidence; where an item declares expected_value/expected_label, evidence
+    must ALSO sit next to the right field label (label-anchored geometry).
+    A deterministic wrong-field guard runs after every action and raises a
+    supervisor alarm the moment a value lands next to the wrong label.
+  * Completion is supervisor-owned: the actioner reports subtask_done /
+    subtask_blocked; only the supervisor may declare task_complete, and only
+    with machine-checked final evidence and no open items.
   * Every action tool carries a 'thought' parameter — the model externalizes
     its reasoning ("what changed, what I'm doing, what I expect") before each
     action. This replaces machine-generated outcome strings.
@@ -21,18 +36,20 @@ Design notes (differences from the previous version):
   * Thrashing detector over the last 6 trail entries.
   * Wait-aware stuck counter (model-initiated waits don't tick it).
   * IoU-based OCR dedup (RapidOCR rarely overlaps, kept as safety net).
-  * Verifier uses explicit task_complete / continue_working; no auto-execute.
   * DwmGetWindowAttribute for true window bounds (fixes edge-click misses).
 
 Public surface preserved for backend/frontend compatibility:
   * ComputerAgent, AgentConfig, _load_config, interactive, main
   * agent.run(instruction) -> dict with 'started_at', 'duration_seconds',
-    'actions', 'tokens'
+    'actions', 'tokens', 'question'
   * actions_log entries retain 'iteration', 'action', 'args', 'result' keys;
-    task_complete entries retain 'claim', 'verified', 'reason'
+    the final supervisor completion is a 'task_complete' entry with 'claim',
+    'verified', 'reason' (the backend extracts the answer from it)
   * Debug screenshot written to $TEMP/agent_screenshot_debug.png each parse
   * logging.getLogger("agent") is the channel the backend hooks
-  * Log markers [SCREENSHOT_READY], [TASK_RESULT] preserved
+  * Log markers [SCREENSHOT_READY], [TASK_RESULT] preserved; new markers
+    [TODOS] (full plan as one-line JSON) and [TODO] (single tick/add events)
+    drive the frontend checklist
 """
 
 from __future__ import annotations
@@ -97,6 +114,12 @@ _YOLO_IOU_THRESH = float(os.getenv("YOLO_IOU_THRESH", "0.3"))
 # Intentionally low (5 %) so even a small text label inside a large icon box
 # causes the YOLO box to be dropped — avoiding redundant blue overlays.
 _YOLO_OCR_OVERLAP_THRESH = float(os.getenv("YOLO_OCR_OVERLAP_THRESH", "0.05"))
+# Fraction of an OCR box that must be covered by a YOLO box for the OCR element
+# to inherit the 'interactive' attribute (text INSIDE a control, e.g. a filled
+# edit field or a labeled button). Deliberately much higher than the suppression
+# threshold: a label merely grazing a field box suppresses the redundant blue
+# overlay but must NOT be tagged interactive itself.
+_YOLO_TEXT_FUSE_THRESH = float(os.getenv("YOLO_TEXT_FUSE_THRESH", "0.5"))
 
 # Local model directory — download_models.py writes here.
 _MODELS_DIR = Path(__file__).parent / "models"
@@ -393,30 +416,31 @@ COMPUTER_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "finish_task",
+            "name": "subtask_done",
             "description": (
-                "Declare the task finished. You MUST cite evidence: specific text "
-                "currently visible on screen that proves the task succeeded. "
+                "Declare the CURRENT TASK (the single task assigned by your "
+                "supervisor) finished. You MUST cite evidence: specific text "
+                "currently visible on screen that proves THIS task's outcome. "
                 "CRITICAL: do NOT cite field labels, form titles, menu items, or "
                 "other UI chrome that was already there before you acted — those "
                 "prove nothing. Cite the OUTCOME of your work: a value you typed "
                 "that now shows in a field, a confirmation/success message, a row "
-                "that now appears in a list, a status label that changed. If you "
-                "cannot find any such outcome text on screen, the task is most "
-                "likely NOT done — do not call finish_task yet."
+                "that now appears in a list, a status label that changed. The claim "
+                "is verified against a fresh screenshot; a false claim is rejected "
+                "and you must keep working."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "Short summary for the user of what was done."
+                        "description": "Short summary of what was done for this task."
                     },
                     "evidence": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "2-5 strings, each being a SHORT, VERBATIM snippet copied "
+                            "1-4 strings, each being a SHORT, VERBATIM snippet copied "
                             "directly from the OCR text on screen — ideally just the "
                             "raw value itself (e.g. '444444', 'Gespeichert', "
                             "'Max Mustermann'). Do NOT add any surrounding words, "
@@ -427,6 +451,34 @@ COMPUTER_TOOLS = [
                     "thought": _THOUGHT_PARAM,
                 },
                 "required": ["message", "evidence", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subtask_blocked",
+            "description": (
+                "Report that you cannot complete the CURRENT TASK: required "
+                "information is missing, the expected control/screen does not "
+                "exist, or repeated attempts keep failing. The supervisor will "
+                "replan (it may rephrase the task, take another route, or ask the "
+                "user). Do NOT use this to skip normal work — try at least a "
+                "couple of different approaches first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Concrete, specific reason — what you tried, what the "
+                            "screen shows instead, what is missing."
+                        ),
+                    },
+                    "thought": _THOUGHT_PARAM,
+                },
+                "required": ["reason", "thought"],
             },
         },
     },
@@ -486,26 +538,6 @@ COMPUTER_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "ask_user",
-            "description": (
-                "Ask the user a clarifying question and stop. Use ONLY when you genuinely cannot "
-                "determine which application or target the request refers to and no reasonable "
-                "default exists. Ends the current run; the user's reply continues this same "
-                "conversation, so you will not lose progress or repeat completed work."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "A specific, concrete question for the user."},
-                    "thought": _THOUGHT_PARAM,
-                },
-                "required": ["question", "thought"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "calculate",
             "description": (
                 "Integer addition/subtraction for deriving pixel coordinates (e.g. the "
@@ -547,146 +579,205 @@ COMPUTER_TOOLS = [
     },
 ]
 
-# Verification-only tools: offered ONLY during completion verification.
-_VERIFICATION_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "finish_task",
-            "description": (
-                "Confirm the task is truly done based on the current screen. "
-                "Cite OUTCOME evidence only — text that shows the work succeeded. "
-                "Do NOT cite field labels, form titles, or menu items that were "
-                "already on screen before the actor acted; those prove nothing."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string"},
-                    "evidence": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "2-5 strings, each being a SHORT, VERBATIM snippet copied "
-                            "directly from the OCR text on screen — ideally just the "
-                            "raw value itself (e.g. '444444', 'Gespeichert'). "
-                            "Do NOT add surrounding words or context."
-                        ),
-                    },
-                    "thought": _THOUGHT_PARAM,
-                },
-                "required": ["message", "evidence", "thought"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "continue_working",
-            "description": (
-                "Reject the completion claim — the task is not yet done. Give a short reason. "
-                "The main loop will resume with your next observation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string"},
-                    "thought": _THOUGHT_PARAM,
-                },
-                "required": ["reason", "thought"],
-            },
-        },
-    },
-]
-
-
-# --- Navigator (goal-holding critic) --------------------------------------- #
+# --- Supervisor (plan-owning controller) ------------------------------------ #
 #
-# The navigator is a SEPARATE, cheap, text-only reasoning role. It never touches
-# the mouse or keyboard. Each step it looks at the ultimate goal, the change-set
-# ("what the last action caused"), and the progress trail — from a neutral
-# outside viewpoint — and answers: are we closer, further, or stuck, and what is
-# the single next objective the actioner should pursue. On 'stuck' it may force a
-# replan by issuing a different next_intent; corrective moves (dismiss a dialog,
-# scroll back) are expressed as intents that the actioner executes through its
-# own guarded tools — preserving a single action pathway.
+# The supervisor is the hierarchical superior of the actioner. It never touches
+# the mouse or keyboard. It owns the PLAN — a dynamically growing todo list —
+# and the actioner is only ever shown the SINGLE item currently assigned to it
+# (never the user's full request). The supervisor is invoked at sub-task
+# BOUNDARIES (item completed/blocked, action budget exhausted) and on ALARMS
+# (wrong-field mutation, stuck screen), not after every action: per-click
+# micromanagement is where dual-model systems thrash. Item completion and final
+# task completion are machine-verified against OCR (presence + label adjacency)
+# before the supervisor may tick them.
 
-NAVIGATOR_SYSTEM_PROMPT = """\
-You are the NAVIGATOR for a computer-use agent operating a hospital information \
-system (HIS). You do NOT control the mouse or keyboard — a separate ACTIONER \
-does that. Your job is to keep the actioner oriented toward the ultimate goal.
+SUPERVISOR_SYSTEM_PROMPT = """\
+You are the SUPERVISOR of a computer-use agent operating a hospital information \
+system (HIS). You never touch the mouse or keyboard — a separate ACTIONER does. \
+You are the actioner's boss: you own the PLAN, a growing todo list, and the \
+actioner is only ever shown the SINGLE item you assign it. It never sees the \
+user's full request — what you write in an item (and its context field) is ALL \
+the actioner knows about the work.
 
-You cannot assume a fixed click-path: the HIS layout is not known in advance and \
-each action's consequences are only learned by observing the screen afterward. \
-So you work in a closed loop: hold the ultimate goal, and after each action judge \
-whether it moved the agent CLOSER to that goal, then set the next concrete \
-objective.
+The HIS layout is not known in advance, so you cannot write the whole plan \
+upfront. Work with a rolling frontier: keep only 1-3 concrete pending items \
+ahead, then EXTEND or REVISE the plan every time you are called, based on what \
+the screen now shows.
 
-Every step you receive:
-  - ULTIMATE GOAL — the user's task; this never changes.
-  - CURRENT OBJECTIVE — what the actioner was just trying to do.
-  - SINCE THE LAST ACTION — a ground-truth diff of what changed on screen \
-(elements that appeared, disappeared, moved, or whose text changed; and whether \
-a scroll, popup, or full screen-replacement occurred). The environment is \
-quiescent between actions, so these changes were caused by the last action.
-  - PROGRESS SO FAR — the history of actions and their outcomes.
-  - CURRENT SCREEN ELEMENTS — the text/elements currently visible.
+WRITING GOOD ITEMS
+- Each item must be achievable in a handful of actions (open a menu, fill one \
+or two fields, save a form). Split anything bigger.
+- Each item must be self-contained: put every fact the actioner needs (names, \
+values to type, which record/patient) into the item text or its context field — \
+the actioner cannot see the user request or the other items.
+- ONLY for items that ENTER or CHANGE data: set expected_value (the exact text \
+that should appear) and expected_label (the field label EXACTLY as written on \
+screen, e.g. 'Last Name *' — never a description like 'button' or an invented \
+label). These are machine-verified against OCR, and typing into a WRONG field \
+is auto-detected from them — they are your early-warning system. Leave BOTH \
+empty for navigation/click items (open a form, press save); presence evidence \
+covers those.
 
-Call `assess` exactly once with:
-  - status: on_track | off_track | stuck | goal_reached
-  - reasoning: ONE sentence — did the last action move closer to the goal?
-  - next_intent: the SINGLE next objective for the actioner, phrased as a concrete \
-instruction achievable in a few actions (e.g. "open the patient search and enter \
-ID 444444", not "complete the task"). Keep the objective small and verifiable.
-  - guidance (optional): a short tactical correction, especially when off_track or \
-stuck — e.g. "a confirmation dialog is open; dismiss it before anything else", \
-"the field scrolled out of view, scroll up ~200px to bring it back", or "this \
-approach has not changed the screen twice; try keyboard Tab instead of clicking".
+WHEN YOU ARE CALLED you receive: the ultimate goal, the todo list, WHY you are \
+called (item completed / blocked / budget exhausted / wrong-field alarm / stuck \
+/ new request), what changed on screen, recent actions, and the current screen \
+elements. Call `update_plan` exactly once:
+- current_item_verdict — judge the ▶ item the actioner just worked on. 'done' \
+ONLY when its outcome is confirmed on screen (a machine evidence check has \
+already run; its result is shown to you — trust it over the actioner's claim). \
+'not_done' keeps the item active for another round; 'failed' abandons it (then \
+add a replacement item that takes a different route).
+- add_items — ONLY genuinely NEW work. The todo list shown to you is the \
+COMPLETE plan: pending (○) items are already queued — do NOT re-add them; \
+duplicates of open items are dropped automatically. Items that FIX A MISTAKE \
+(value typed into the wrong field, wrong record opened, stray dialog, corrupted \
+data) get corrective=true and jump to the FRONT of the queue: mistakes are \
+fixed before any new work.
+- obsolete_item_ids — close OPEN items that should not be worked: duplicates, \
+superseded plans, or work already covered by completed items. Working a stale \
+item re-executes actions against already-saved data — close it instead.
+- control:
+    'continue'      — keep working (the normal case).
+    'ask_user'      — something only the user can resolve (missing information, \
+ambiguous requirement); put the specific question in control_detail.
+    'stop'          — the goal is unreachable or the same failure keeps \
+repeating despite replanning; put the reason in control_detail.
+    'task_complete' — EVERYTHING is done. Allowed only when no items are open \
+(close leftover duplicates/superseded items via obsolete_item_ids IN THE SAME \
+call). Provide final_evidence: 2-4 OUTCOME values currently visible on screen, \
+each with the field label it sits next to when applicable. They are \
+machine-checked against OCR — field labels alone, form titles, and menu names \
+prove nothing. Put a short user-facing summary of what was accomplished in \
+control_detail.
 
-Rules:
-  - Judge only against the ULTIMATE GOAL, not against whether the last action \
-"worked" in isolation. An action can succeed yet move away from the goal.
-  - If SINCE THE LAST ACTION shows a popup/dialog or a screen replacement, the \
-next_intent must deal with that first.
-  - Only report goal_reached when the diff/screen shows concrete OUTCOME evidence \
-of success (a typed value now present, a success message, a new row) — not merely \
-that the right form or menu is visible.
-  - Be decisive and brief. You are the map, not the driver.
+RULES
+- Never mark an item done because the actioner says so — only on verified \
+screen evidence.
+- A popup/dialog or screen replacement must be dealt with before anything \
+else: insert a corrective item for it.
+- If the same item keeps failing (blocked or budget-exhausted twice), do NOT \
+reissue it unchanged — rephrase it, split it, take a different route through \
+the UI, or stop.
+- Use the exact field labels and values as they appear in the UI's language \
+(German or English).
+- Be decisive and brief. You are the boss, not a commentator.
 """
 
-NAVIGATOR_TOOLS = [
+SUPERVISOR_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "assess",
+            "name": "update_plan",
             "description": (
-                "Report where the task stands relative to the ULTIMATE GOAL and set "
-                "the next concrete objective for the actioner."
+                "Assess the event you were called for, give a verdict on the "
+                "current todo item, extend/revise the plan, and decide how to "
+                "proceed. Call exactly once."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {
+                    "assessment": {
                         "type": "string",
-                        "enum": ["on_track", "off_track", "stuck", "goal_reached"],
+                        "description": "ONE sentence: where the task stands after this event.",
                     },
-                    "reasoning": {
+                    "current_item_verdict": {
                         "type": "string",
-                        "description": "One sentence: did the last action move closer to the ultimate goal?",
-                    },
-                    "next_intent": {
-                        "type": "string",
+                        "enum": ["done", "not_done", "failed", "no_current_item"],
                         "description": (
-                            "The single next objective for the actioner, as a concrete "
-                            "instruction achievable in a few actions."
+                            "Verdict on the ▶ item the actioner just worked on. 'done' only "
+                            "with confirmed on-screen outcome; 'not_done' keeps it active; "
+                            "'failed' abandons it (add a replacement)."
+                        ),
+                    },
+                    "verdict_reason": {
+                        "type": "string",
+                        "description": "One short line justifying the verdict.",
+                    },
+                    "add_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "description": (
+                                        "Concrete, self-contained instruction for the actioner, "
+                                        "achievable in a handful of actions."
+                                    ),
+                                },
+                                "context": {
+                                    "type": "string",
+                                    "description": (
+                                        "Facts the actioner needs for this item (values, names, "
+                                        "record IDs). The actioner sees nothing else."
+                                    ),
+                                },
+                                "expected_value": {
+                                    "type": "string",
+                                    "description": (
+                                        "DATA-ENTRY items only: exact text that must appear on "
+                                        "screen when this item succeeds. Leave empty for "
+                                        "navigation/click items."
+                                    ),
+                                },
+                                "expected_label": {
+                                    "type": "string",
+                                    "description": (
+                                        "DATA-ENTRY items only: the field label EXACTLY as visible "
+                                        "on screen (e.g. 'Last Name *'). Never a description like "
+                                        "'button'. Leave empty for navigation/click items."
+                                    ),
+                                },
+                                "corrective": {
+                                    "type": "boolean",
+                                    "description": "true = fixes a mistake/side-effect; jumps to the FRONT of the queue.",
+                                },
+                            },
+                            "required": ["text"],
+                        },
+                        "description": "New todo items. Omit or leave empty when the plan already covers the next steps.",
+                    },
+                    "obsolete_item_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "Ids of OPEN items that should NOT be worked: duplicates, "
+                            "superseded plans, or work already satisfied by completed "
+                            "items. They are closed as 'skipped' without execution. "
+                            "Clear such leftovers with (or before) task_complete — "
+                            "completion is rejected while they stay open, and working "
+                            "them would redo actions against already-saved data."
                         ),
                     },
                     "guidance": {
                         "type": "string",
-                        "description": "Optional short tactical correction or hint for the actioner.",
+                        "description": "Optional ONE-line tactical hint shown to the actioner with its next item.",
+                    },
+                    "control": {
+                        "type": "string",
+                        "enum": ["continue", "ask_user", "stop", "task_complete"],
+                    },
+                    "control_detail": {
+                        "type": "string",
+                        "description": (
+                            "ask_user: the question. stop: the reason. task_complete: a short "
+                            "user-facing summary of what was accomplished."
+                        ),
+                    },
+                    "final_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "value": {"type": "string", "description": "Verbatim OCR outcome text visible on screen."},
+                                "label": {"type": "string", "description": "Field label the value sits next to (empty if not applicable)."},
+                            },
+                            "required": ["value"],
+                        },
+                        "description": "task_complete only: 2-4 outcome values currently visible on screen.",
                     },
                 },
-                "required": ["status", "reasoning", "next_intent"],
+                "required": ["assessment", "current_item_verdict", "control"],
             },
         },
     },
@@ -787,6 +878,10 @@ class Element:
     automation_id: str = ""
     parent_text: str = ""
     last_seen_frame: int = 0
+    # OCR text that sits INSIDE a YOLO-detected control (filled edit field,
+    # labeled button): the redundant YOLO box is dropped at merge time, but the
+    # "this is clickable" information is fused onto the text element.
+    interactive: bool = False
 
     def as_prompt_line(self) -> str:
         if self.source == "yolo":
@@ -797,7 +892,8 @@ class Element:
         text = self.text.replace("\n", " ").strip()
         if len(text) > 60:
             text = text[:57] + "..."
-        return f"[{self.stable_id}] '{text}' @({self.center_x},{self.center_y})"
+        suffix = " <interactive>" if self.interactive else ""
+        return f"[{self.stable_id}] '{text}' @({self.center_x},{self.center_y}){suffix}"
 
 
 @dataclass
@@ -843,6 +939,11 @@ class ChangeSet:
     text_changed: List[ElementChange] = field(default_factory=list)
     transition: str = ""
     scroll_dy: int = 0        # scroll only: median vertical shift (+ = content moved down)
+    # Screen-absolute position of a blinking text caret, detected as a byproduct
+    # of decaret (the caret is REMOVED from the screenshot, so this is the ONLY
+    # signal that a click landed in an edit field — clicking into a field often
+    # causes no other visible change).
+    caret_xy: Optional[Tuple[int, int]] = None
 
     @property
     def is_empty(self) -> bool:
@@ -850,6 +951,18 @@ class ChangeSet:
 
     def render(self) -> str:
         """Human/LLM-readable 'SINCE YOUR LAST ACTION' block. Empty string if nothing changed."""
+        base = self._render_base()
+        if self.caret_xy:
+            base += (
+                f"\nFOCUS INDICATOR: a text caret is blinking at "
+                f"({self.caret_xy[0]},{self.caret_xy[1]}) — the edit field there IS "
+                "focused. (The caret is removed from the screenshot; a click into a "
+                "field often causes no other visible change. Do NOT re-click — type "
+                "or select text now.)"
+            )
+        return base
+
+    def _render_base(self) -> str:
         if self.transition == "replaced":
             return (
                 "SINCE YOUR LAST ACTION: the screen was REPLACED "
@@ -886,6 +999,12 @@ class ChangeSet:
 
     def summary(self) -> str:
         """Compact single-line summary — safe for the (newline-delimited) log/SSE stream."""
+        s = self._summary_base()
+        if self.caret_xy:
+            s += f"; caret blinking at ({self.caret_xy[0]},{self.caret_xy[1]}) — field focused"
+        return s
+
+    def _summary_base(self) -> str:
         if self.transition == "replaced":
             return f"screen replaced ({len(self.disappeared)} gone, {len(self.appeared)} new)"
         if self.transition == "scroll":
@@ -1347,7 +1466,11 @@ def capture_foreground() -> Tuple[Image.Image, Tuple[int, int, int, int]]:
 # agnostic (fills from neighbouring background), so it works for a dark caret on
 # a light field or vice versa. Requires the caret to blink (>=1 'off' frame).
 
-_DECARET_FRAMES = int(os.getenv("DECARET_FRAMES", "3"))
+# 4 frames x 0.18s spans 0.54s — just over the ~0.53s ON phase of the standard
+# Windows caret blink, so at least one caret-OFF frame is guaranteed. (3 frames
+# spanned only 0.36s and could land entirely inside the ON phase, letting the
+# caret survive into OCR as a phantom 'l'/'I'.)
+_DECARET_FRAMES = int(os.getenv("DECARET_FRAMES", "4"))
 _DECARET_INTERVAL_S = float(os.getenv("DECARET_INTERVAL_S", "0.18"))
 _DECARET_DIFF_THRESH = int(os.getenv("DECARET_DIFF_THRESH", "26"))  # 0-255 grayscale delta
 _DECARET_RING_PX = int(os.getenv("DECARET_RING_PX", "3"))          # width of the surrounding ring sampled per region
@@ -1382,10 +1505,14 @@ def capture_foreground_burst(
     return [img], rect
 
 
-def _decaret(frames: List[Image.Image]) -> Image.Image:
-    """Return the first frame with the blinking caret (and any other pixels that
-    changed between frames) replaced by the REAL pixels from the frame where the
-    caret is off — never a synthesised/inpainted colour.
+def _decaret(frames: List[Image.Image]) -> Tuple[Image.Image, List[Tuple[int, int]]]:
+    """Return (healed_image, caret_centers): the first frame with the blinking
+    caret (and any other pixels that changed between frames) replaced by the
+    REAL pixels from the frame where the caret is off — never a synthesised/
+    inpainted colour — plus the centers (image-relative x, y) of healed regions
+    whose shape looks like a text caret (thin vertical bar). The caret is the
+    ONLY visible evidence that a click focused an edit field, and healing it
+    erases that evidence from the screenshot — so it is reported instead.
 
     Method: diff the frames to a change mask, group it into regions (each a
     blinking element), and for each region sample the field colour in a thin ring
@@ -1399,7 +1526,7 @@ def _decaret(frames: List[Image.Image]) -> Image.Image:
         raise ValueError("_decaret: no frames")
     ref = frames[0]
     if len(frames) < 2:
-        return ref
+        return ref, []
     try:
         import cv2
         arrs = [np.asarray(f.convert("RGB")).astype(np.uint8) for f in frames]
@@ -1412,12 +1539,20 @@ def _decaret(frames: List[Image.Image]) -> Image.Image:
         mask = (spread > _DECARET_DIFF_THRESH).astype(np.uint8)
         changed = int(mask.sum())
         if changed == 0:
-            return ref
+            return ref, []
         ring_k = np.ones((2 * _DECARET_RING_PX + 1, 2 * _DECARET_RING_PX + 1), np.uint8)
         n_labels, labels = cv2.connectedComponents(mask, connectivity=8)
         out = arrs[0].copy()
+        carets: List[Tuple[int, int]] = []
         for lbl in range(1, n_labels):
             region = labels == lbl
+            # Caret-shaped blinker? Thin vertical bar: much taller than wide,
+            # text-line sized. Recorded BEFORE healing erases the evidence.
+            ys, xs = np.nonzero(region)
+            rw = int(xs.max() - xs.min() + 1)
+            rh = int(ys.max() - ys.min() + 1)
+            if rw <= 8 and 8 <= rh <= 64 and rh >= 2 * rw:
+                carets.append((int(xs.mean()), int(ys.mean())))
             # Shape-following ring just outside the region; never sample another
             # changed pixel (mask == 0), so a nearby blinker can't bias the colour.
             ring = (cv2.dilate(region.astype(np.uint8), ring_k) > 0) & (mask == 0)
@@ -1431,12 +1566,13 @@ def _decaret(frames: List[Image.Image]) -> Image.Image:
                 ),
             )
             out[region] = arrs[best][region]                # copy the caret-off frame's real pixels
-        log.info("decaret: healed %d changed px in %d region(s) across %d frames",
-                 changed, n_labels - 1, len(frames))
-        return Image.fromarray(out)
+        log.info("decaret: healed %d changed px in %d region(s) across %d frames%s",
+                 changed, n_labels - 1, len(frames),
+                 f"; caret detected at {carets[0]}" if carets else "")
+        return Image.fromarray(out), carets
     except Exception as exc:
         log.warning("_decaret failed (%s: %s) — using raw frame.", type(exc).__name__, exc)
-        return ref
+        return ref, []
 
 
 # --- Image annotation ------------------------------------------------------ #
@@ -1562,11 +1698,13 @@ def annotate_screenshot(
         ih = el.height
 
         # Faint box for every element; brighter for high-confidence / labeled ones.
-        # OCR elements: orange. YOLO icon elements: blue.
+        # OCR elements: orange. YOLO icon elements — and OCR text fused with a
+        # YOLO control (text inside a clickable field/button): blue.
         is_yolo = el.source == "yolo"
-        color_full = (50, 150, 255, 220) if is_yolo else (255, 140, 0, 220)
-        color_faint = (50, 150, 255, 90) if is_yolo else (255, 140, 0, 90)
-        label_color = (130, 210, 255) if is_yolo else (255, 200, 80)
+        is_clickable = is_yolo or el.interactive
+        color_full = (50, 150, 255, 220) if is_clickable else (255, 140, 0, 220)
+        color_faint = (50, 150, 255, 90) if is_clickable else (255, 140, 0, 90)
+        label_color = (130, 210, 255) if is_clickable else (255, 200, 80)
         # Always label YOLO elements (they're few and high-value); OCR elements
         # need confidence >= 40 to earn a label (avoids cluttering low-conf noise).
         show_label = i < max_label_elements and (is_yolo or el.confidence >= 40)
@@ -1650,6 +1788,9 @@ class ActionExecutor:
     def _resolve_point(self, args: Dict[str, Any]) -> Tuple[Optional[Tuple[int, int]], str]:
         eid = args.get("element_id")
         if eid:
+            # Models copy the id straight from the prompt line '[e75] ...' —
+            # tolerate the brackets instead of burning a round on an error.
+            eid = str(eid).strip().strip("[]")
             el = self.registry.get(eid)
             if el is None:
                 return None, (
@@ -1920,11 +2061,19 @@ class ProgressTrail:
             except TypeError:
                 continue  # tolerate schema drift across versions
 
-    def render(self) -> str:
+    def render(self, limit: Optional[int] = None) -> str:
         if not self._entries:
             return ""
-        lines = ["PROGRESS SO FAR (all actions, thoughts, and outcomes — do NOT repeat failed approaches):"]
-        for e in self._entries:
+        entries = list(self._entries)
+        if limit is not None and len(entries) > limit:
+            header = (f"PROGRESS SO FAR (last {limit} of {len(entries)} actions, "
+                      "with thoughts and outcomes):")
+            entries = entries[-limit:]
+        else:
+            header = ("PROGRESS SO FAR (all actions, thoughts, and outcomes — "
+                      "do NOT repeat failed approaches):")
+        lines = [header]
+        for e in entries:
             status = "✓ screen changed" if e.screen_changed else "— no visible change"
             thought = e.thought.strip() or "(no thought)"
             target = f"{e.target_key}('{e.target_label}')" if e.target_label else e.target_key
@@ -2119,6 +2268,239 @@ def format_evidence_rejection(details: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# --- Spatial evidence (label-anchored checks + wrong-field guard) ---------- #
+#
+# Presence-only evidence has a hole: a value typed into the WRONG field still
+# passes, because the text is on screen — just in the wrong place. These helpers
+# anchor a value to the field label it must sit next to, using pure geometry on
+# the OCR elements (no LLM cost):
+#   * check_value_near_label — used to tick a todo item and for final evidence.
+#   * guard_wrong_field      — runs after every action on the deterministic
+#     change-set; fires an alarm the moment a value lands next to a label other
+#     than the expected one (the #1 form-filling mistake).
+
+def _fuzzy_text_match(needle: str, hay: str, thresh: float = 0.8) -> bool:
+    """True if `needle` matches `hay` (containment or whole-string fuzzy)."""
+    n = (needle or "").strip().lower()
+    h = (hay or "").strip().lower()
+    if not n or not h:
+        return False
+    if n in h or h in n:
+        return True
+    return difflib.SequenceMatcher(None, n, h).ratio() >= thresh
+
+
+def _value_in_text(value: str, text: str, fuzzy_threshold: float = 0.85) -> bool:
+    """Does element `text` contain the (possibly OCR-garbled) `value`?
+
+    Mirrors check_evidence_in_ocr's word logic, scoped to one element: at least
+    60% of the value's meaningful words must be present (exact or fuzzy)."""
+    if not text:
+        return False
+    words = _extract_meaningful_words(value)
+    if not words:
+        return _fuzzy_text_match(value, text, fuzzy_threshold)
+    text_lower = text.lower()
+    hits = 0
+    for w in words:
+        if w in text_lower:
+            hits += 1
+            continue
+        ratio, _tok = _best_fuzzy_match(w, text)
+        if ratio >= fuzzy_threshold:
+            hits += 1
+    return (hits / len(words)) >= 0.6
+
+
+def _label_in_text(label: str, text: str) -> bool:
+    """Does `text` begin with (or contain as words) the field label?
+
+    Catches the very common OCR merge of label and value into ONE element
+    ('Id: P00004' → 'IdP00004', 'Nachname: Doe' → 'Nachname Doe'), where
+    box-to-box adjacency can never match."""
+    def norm(s: str) -> str:
+        return " ".join(re.sub(r"[:*]", " ", (s or "").lower()).split())
+    ln, tn = norm(label), norm(text)
+    if not ln or not tn:
+        return False
+    return tn.startswith(ln) or f" {ln} " in f" {tn} "
+
+
+def _find_label_elements(label: str, elements: List[Element]) -> List[Element]:
+    """OCR elements whose text matches `label` (fuzzy, tolerant of ':' etc.)."""
+    out = []
+    for el in elements:
+        if el.source == "yolo" or not (el.text or "").strip():
+            continue
+        el_text = el.text.strip().rstrip(":").strip()
+        if _fuzzy_text_match(label.strip().rstrip(":"), el_text, 0.75):
+            out.append(el)
+    return out
+
+
+def _is_value_adjacent_to_label(value_el: Element, label_el: Element) -> bool:
+    """Geometric adjacency for form layouts: value on the same row to the right
+    of the label, or directly below it."""
+    if value_el is label_el:
+        return False
+    # Same row, value to the right of the label.
+    row_tol = max(14, int(0.8 * max(value_el.height, label_el.height)))
+    if abs(value_el.center_y - label_el.center_y) <= row_tol:
+        gap = value_el.x - (label_el.x + label_el.width)
+        if -10 <= gap <= 400:
+            return True
+    # Value directly below the label (label-above-field layout).
+    vgap = value_el.y - (label_el.y + label_el.height)
+    if 0 <= vgap <= 70:
+        overlap = (min(value_el.x + value_el.width, label_el.x + label_el.width)
+                   - max(value_el.x, label_el.x))
+        if overlap > 0 or abs(value_el.x - label_el.x) <= 40:
+            return True
+    return False
+
+
+def _nearest_label(el: Element, elements: List[Element]) -> Optional[Element]:
+    """The label element `el` most plausibly belongs to (left on the same row,
+    or directly above), or None."""
+    best, best_d = None, float("inf")
+    for cand in elements:
+        if cand is el or cand.source == "yolo":
+            continue
+        text = (cand.text or "").strip()
+        if not text or not any(ch.isalpha() for ch in text):
+            continue
+        if _is_value_adjacent_to_label(el, cand):
+            d = abs(el.center_y - cand.center_y) + max(0, el.x - (cand.x + cand.width))
+            if d < best_d:
+                best, best_d = cand, d
+    return best
+
+
+def check_value_near_label(
+    value: str, label: str, elements: List[Element]
+) -> Tuple[str, str]:
+    """Label-anchored evidence check. Returns (verdict, detail):
+      'pass'     — the value is on screen adjacent to (or merged with) the label.
+      'fail'     — the value is missing, or present only next to OTHER labels.
+      'no_label' — the expected label is not on screen (fall back to presence)."""
+    value_els = [el for el in elements
+                 if el.source != "yolo" and _value_in_text(value, el.text)]
+    # Same-element case first: OCR often merges 'Label: value' into one box,
+    # and box-to-box adjacency can never match an element against itself.
+    for v_el in value_els:
+        if _label_in_text(label, v_el.text):
+            return "pass", f"'{v_el.text.strip()}' contains both '{label}' and the value"
+    label_els = _find_label_elements(label, elements)
+    if not label_els:
+        return "no_label", f"label '{label}' not found on screen (OCR may have missed it)"
+    if not value_els:
+        return "fail", f"value '{value}' is not visible anywhere on screen"
+    for v_el in value_els:
+        for l_el in label_els:
+            if _is_value_adjacent_to_label(v_el, l_el):
+                return "pass", (
+                    f"'{v_el.text.strip()}' found next to '{l_el.text.strip()}'"
+                )
+    near = _nearest_label(value_els[0], elements)
+    where = f" (it appears next to '{near.text.strip()}')" if near else ""
+    return "fail", f"value '{value}' is on screen but NOT next to '{label}'{where}"
+
+
+def guard_wrong_field(
+    change: "ChangeSet", todo: "TodoItem", elements: List[Element]
+) -> Optional[str]:
+    """Deterministic wrong-field detector, run after every action.
+
+    If the current todo expects `value` next to `label` and the change-set shows
+    that value materializing ONLY next to DIFFERENT labels, return an alarm
+    string; else None. Pure geometry — no LLM call.
+
+    Echo suppression: applications commonly mirror an edited value elsewhere on
+    the same screen (page title, breadcrumb, list row — e.g. HospitalRun shows
+    'John Doe-Doe' in the header the moment the Last Name field is edited).
+    So the alarm fires only when the value landed EXCLUSIVELY in wrong places:
+    one hit next to the expected label proves the edit itself was correct, and
+    the other occurrences are echoes, not mistakes."""
+    if todo is None or not todo.expected_value or not todo.expected_label:
+        return None
+    # Scan text_changed AND appeared: typing into an EMPTY field registers as
+    # 'appeared' (there was no old element to pair with), not 'text_changed' —
+    # without this, the correct-field hit is invisible and an echo elsewhere
+    # (page title) raises a false alarm.
+    mutations = change.text_changed + change.appeared
+    if not mutations:
+        return None
+    expected_labels = _find_label_elements(todo.expected_label, elements)
+    if not expected_labels:
+        # The expected label is not OCR-visible — geometry cannot distinguish
+        # right from wrong field, so do not alarm (avoid false positives).
+        return None
+    wrong_hits: List[Element] = []
+    for ch in mutations:
+        el = ch.element
+        if not _value_in_text(todo.expected_value, el.text):
+            continue
+        if (_label_in_text(todo.expected_label, el.text)
+                or any(_is_value_adjacent_to_label(el, l_el) for l_el in expected_labels)):
+            return None  # landed in the right field — other occurrences are echoes
+        wrong_hits.append(el)
+    if not wrong_hits:
+        return None
+    el = wrong_hits[0]
+    near = _nearest_label(el, elements)
+    near_txt = f"'{near.text.strip()}'" if near else "an unidentified field"
+    return (
+        f"the value '{todo.expected_value}' just appeared next to {near_txt}, "
+        f"but it was expected next to '{todo.expected_label}'. The actioner "
+        f"probably typed into the wrong field."
+    )
+
+
+def _extract_tool_args_from_content(
+    content: str, known_keys: Optional[frozenset] = None
+) -> Dict[str, Any]:
+    """Best-effort recovery of tool-call arguments from plain text content.
+
+    Some models/servers leak the function call into `content` — raw JSON, a
+    fenced ```json block, JSON wrapped in prose, or a
+    {"name": ..., "arguments": {...}} envelope — instead of populating
+    tool_calls. Scans every '{' with a tolerant raw_decode, preferring the
+    first object that contains one of `known_keys`. Returns {} on failure."""
+    if not content:
+        return {}
+
+    def unwrap(obj: Dict[str, Any]) -> Dict[str, Any]:
+        for key in ("arguments", "parameters"):
+            inner = obj.get(key)
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except json.JSONDecodeError:
+                    inner = None
+            if isinstance(inner, dict):
+                return inner
+        return obj
+
+    decoder = json.JSONDecoder()
+    fallback: Dict[str, Any] = {}
+    for m in re.finditer(r"\{", content):
+        try:
+            obj, _end = decoder.raw_decode(content[m.start():])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        obj = unwrap(obj)
+        if not isinstance(obj, dict):
+            continue
+        if known_keys and known_keys & set(obj.keys()):
+            return obj
+        if not fallback:
+            fallback = obj
+        if not known_keys:
+            return obj
+    return fallback
+
 
 class ConversationHistory:
     """
@@ -2139,16 +2521,25 @@ class ConversationHistory:
         self._keep_tool_turns = keep_tool_turns
         self._task: str = ""
 
-    def add_initial_user(self, task: str, element_text: str, screenshot_b64: str) -> None:
-        """Send the first observation: screenshot → elements → task (no progress trail yet)."""
-        self._task = task
+    def add_initial_user(self, task_block: str, element_text: str, screenshot_b64: str) -> None:
+        """Send the first observation: screenshot → elements → current task block.
+
+        `task_block` is the supervisor-rendered CURRENT TASK block (see
+        render_current_task) — the actioner's ONLY view of the work. It is
+        re-appended to every observation and swapped via set_task() whenever
+        the supervisor assigns the next todo item."""
+        self._task = task_block
         self._messages.append({
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
-                {"type": "text", "text": f"{element_text}\n\nTASK: {task}"},
+                {"type": "text", "text": f"{element_text}\n\n{task_block}"},
             ],
         })
+
+    def set_task(self, task_block: str) -> None:
+        """Swap the CURRENT TASK block (supervisor assigned the next item)."""
+        self._task = task_block
 
     def add_assistant(self, message: dict) -> None:
         self._messages.append(message)
@@ -2186,7 +2577,7 @@ class ConversationHistory:
         """Append an observation message ordered: screenshot → elements → task → progress."""
         text = element_text
         if self._task:
-            text += f"\n\nTASK: {self._task}"
+            text += f"\n\n{self._task}"
         if note:
             text += f"\n\n{note}"
         self._messages.append({
@@ -2252,14 +2643,20 @@ class ConversationHistory:
 # --- Agent ----------------------------------------------------------------- #
 
 SYSTEM_PROMPT = """\
-You are an expert AI agent controlling a computer via OCR + screenshot observation. \
+You are the ACTIONER of a two-level computer-use agent, controlling a computer \
+via OCR + screenshot observation. A SUPERVISOR owns the overall plan and assigns \
+you ONE task at a time in a "CURRENT TASK" block — that block is your entire \
+job. Do NOT pursue anything beyond the current task: no extra fields, no \
+navigation "while you are at it", no guessing at the larger goal. \
 You receive, every step: (1) an annotated screenshot with orange boxes for OCR \
 elements and blue boxes for interactive regions, both labeled with stable IDs, plus \
 a cyan crosshair marking your last click; (2) two element lists — \
-"OCR TEXT ELEMENTS" in the form [id] 'text' @(cx,cy), and \
+"OCR TEXT ELEMENTS" in the form [id] 'text' @(cx,cy) — entries suffixed \
+<interactive> are text sitting INSIDE a clickable control (a FILLED edit field, \
+a labeled button): that element IS the control, click it to interact — and \
 "INTERACTIVE REGIONS" in the form [id] <interactive> @(cx,cy) WxH (visually detected \
-buttons, icons, and empty input fields that OCR cannot see); all coordinates are \
-screen-absolute; (3) a TASK reminder; (4) a PROGRESS SO FAR block summarizing \
+buttons, icons, and EMPTY input fields that OCR cannot see); all coordinates are \
+screen-absolute; (3) the CURRENT TASK block; (4) a PROGRESS SO FAR block summarizing \
 what you have done, what you thought, and what changed.
 
 BEFORE EVERY ACTION — read the PROGRESS SO FAR block carefully. For each \
@@ -2276,26 +2673,30 @@ Keep it under 50 words. This is how you remember your plan and notice mistakes.
 
 RULES:
 - FIRST ACTION, ALWAYS: bring the correct application to the foreground before \
-  any click/type/keypress/scroll. Derive WHICH application from the user's \
-  request. Call focus_window (call list_windows first if you need the exact \
-  titles). Input actions are BLOCKED by the executor until a window has been \
-  focused this run — a focus is not optional. \
+  any click/type/keypress/scroll. Derive WHICH application from the CURRENT \
+  TASK and its CONTEXT. Call focus_window (call list_windows first if you need \
+  the exact titles). Input actions are BLOCKED by the executor until a window \
+  has been focused this run — a focus is not optional. \
   - If the target application is not open (not in list_windows), call \
     open_application(name) to launch it, then continue. \
-  - If it is genuinely unclear which application the request refers to and no \
-    reasonable default exists, call ask_user(question) with a specific question \
-    and stop; the user's reply continues this same conversation.
+  - If it is genuinely unclear which application the task refers to and no \
+    reasonable default exists, call subtask_blocked with a specific reason; \
+    the supervisor will resolve it (possibly by asking the user).
 - Prefer element_id over raw x/y. Coordinates are screen-absolute. \
   If you must use raw x/y, always derive them from the @(cx,cy) values in the \
   current element list — it should always be in pixel coordinates, not in ratios. Use the \
   calculate tool to adjust (e.g. cx + 40) when the click target is beside a label.
-- Form fields are often NOT detected by OCR when empty — only the label beside \
+- To EDIT a field that ALREADY CONTAINS text (e.g. change an existing last \
+  name): the existing text element IS the field — click that text element \
+  (ideally one tagged <interactive>), then clear and retype. Do NOT hunt for a \
+  separate empty INTERACTIVE REGION for it; a filled field is not listed there.
+- EMPTY form fields are often NOT detected by OCR — only the label beside \
   them is. An empty field may appear as an INTERACTIVE REGION (blue box, <interactive>); \
   click it by element_id if present. Otherwise click just to the right of the \
   label, or use click_and_type with x/y to focus-and-fill in one step. Verify by \
   checking whether your typed text appears in the next OCR TEXT ELEMENTS list.
-- INTERACTIVE REGIONS (<interactive>) have no text — use their element_id to click them. \
-  They represent buttons, icons, and empty fields the OCR cannot read.
+- INTERACTIVE REGIONS (<interactive> section) have no text — use their element_id to \
+  click them. They represent buttons, icons, and EMPTY fields the OCR cannot read.
 - If OCR shows text that should have been cleared is still there, your clear \
   attempt did NOT succeed — do not retype or you will append instead of replace. \
   Use this escalation ladder until one works: \
@@ -2312,21 +2713,35 @@ RULES:
   click blindly. Instead, use calculate to derive corrected coordinates \
   (e.g. element_cx + 40) from the nearest element's @(cx,cy) listed below, then \
   click with raw x/y.
+- Clicking INTO an edit field usually causes NO visible change — the blinking \
+  caret is removed from screenshots. Watch for the FOCUS INDICATOR line ("a text \
+  caret is blinking at (x,y)") in the observation: it means your click DID focus \
+  the field at that position. Proceed with Ctrl+A / typing — do NOT click again \
+  or switch to another element. Judge the edit by the text change afterwards.
+- If a warning/error dialog appears, READ its message in the OCR elements \
+  BEFORE dismissing it — it usually names the cause. If that cause is outside \
+  your CURRENT TASK (e.g. "required fields missing" while your task is only to \
+  press save), dismiss the dialog and call subtask_blocked QUOTING the message. \
+  Never repeat the action that raised the dialog hoping for a different result.
 - If the screen does not change after an action, do NOT repeat the same action. \
   Reassess. If thrashing is warned about, change approach entirely.
 - If you expect a delay (save, dialog appearing, data loading), use wait() \
   explicitly — waits are not counted against the stuck-screen detector.
-- To declare the task done, call finish_task. You MUST cite 2-5 short pieces \
-  of evidence: specific text currently visible on screen that proves the task \
-  succeeded. Quote the text literally as it appears. \
+- To declare the CURRENT TASK done, call subtask_done. You MUST cite 1-4 short \
+  pieces of evidence: specific text currently visible on screen that proves \
+  THIS task's outcome. Quote the text literally as it appears. \
   CRITICAL: field labels, form titles, menu items, and other UI chrome that \
   was already on screen before you acted do NOT count as evidence — they prove \
   nothing. Cite the OUTCOME of your work: a value you typed that now shows in \
   a field, a confirmation/success message, a new row in a list, a changed \
   status. If you cannot find such outcome text on the screen, the task is \
-  most likely not done — keep working instead of calling finish_task. \
-  Your evidence is checked against OCR; bogus evidence is rejected and you \
-  must keep working.
+  most likely not done — keep working instead of calling subtask_done. \
+  Your evidence is checked against OCR (including WHERE it appears, next to \
+  which label); bogus evidence is rejected and you must keep working. \
+- If you cannot complete the CURRENT TASK — the control does not exist, \
+  information is missing, or several different approaches failed — call \
+  subtask_blocked with a concrete reason. That is the correct move; do NOT \
+  drift into other work or silently pick a different goal.
 - You may issue MULTIPLE tool calls in a single response whenever you are \
   confident the actions are safe to run in sequence without seeing the \
   intermediate result first (e.g. list_windows → focus_window, or filling \
@@ -2352,12 +2767,22 @@ class AgentConfig:
     verify_tls: bool = False
     ocr_min_conf: int = 30
     save_debug_screenshots: bool = True
-    # Navigator (goal-holding critic). When enabled, a cheap text-only role
-    # re-assesses progress toward the goal each step and sets the actioner's
-    # next objective. Set NAVIGATOR=0 in the environment to A/B against the
-    # plain ReAct loop.
+    # Supervisor (plan-owning controller). It is integral to the architecture —
+    # it owns the todo list, assigns one item at a time to the actioner, and is
+    # the only role that can complete the overall task. NAVIGATOR=0 is accepted
+    # for backwards compatibility but only logs a warning.
     use_navigator: bool = True
-    navigator_max_tokens: int = 400
+    # The supervisor writes plans (multiple todo items + verdict), so it needs
+    # more room than the old per-step navigator did.
+    navigator_max_tokens: int = 700
+    # Actioner iterations allowed per todo item before the supervisor is forced
+    # to review (revise/split/fail the item). Sub-task boundaries — not every
+    # action — are where supervision happens; this bounds a runaway sub-task.
+    subtask_max_iterations: int = 8
+    # Optional stronger model for the supervisor (text-only reasoning).
+    # None → use the actioner's model. Same endpoint/key (shared proxy); only the
+    # model id differs. Set via NAVIGATOR_MODEL or NAVIGATOR_PROFILE in .env.
+    navigator_model: Optional[str] = None
     # Narrator (on-demand VLM observer). Invoked only on ambiguous transitions
     # or when stuck, to catch visual-state changes the element diff misses.
     # Set NARRATOR=0 to disable. Requires the navigator.
@@ -2368,24 +2793,198 @@ class AgentConfig:
     continue_session: bool = True
 
 
-@dataclass
-class NavigatorState:
-    """The navigator's running belief: fixed goal + evolving objective/assessment."""
-    ultimate_goal: str = ""
-    current_intent: str = ""          # the objective the actioner is pursuing now
-    last_status: str = ""             # on_track | off_track | stuck | goal_reached
-    last_reasoning: str = ""
-    guidance: str = ""                # tactical hint injected into the actioner's note
-    stuck_rounds: int = 0             # consecutive navigator 'stuck'/'off_track' verdicts
-    last_narration: str = ""          # most recent narrator observation, fed to the next assessment
-    prior_tasks: List[str] = field(default_factory=list)  # earlier requests in this conversation
+# --- Plan (the supervisor's dynamically growing todo list) ------------------ #
 
-    def render_for_actioner(self) -> str:
-        """The block prepended to the actioner's observation each step."""
-        lines = [f"CURRENT OBJECTIVE (set by navigator): {self.current_intent}"]
-        if self.guidance:
-            lines.append(f"NAVIGATOR GUIDANCE: {self.guidance}")
+_STATUS_GLYPHS = {"pending": "○", "in_progress": "▶", "done": "✓", "failed": "✗",
+                  "skipped": "−"}
+
+
+@dataclass
+class TodoItem:
+    """One work item in the supervisor's plan. The actioner only ever sees the
+    single item assigned to it (text + context + expected outcome)."""
+    id: int
+    text: str
+    status: str = "pending"        # pending | in_progress | done | failed
+    context: str = ""              # facts the actioner needs (values, names, IDs)
+    expected_value: str = ""       # exact text that must appear on success
+    expected_label: str = ""       # field label the value must appear next to
+    corrective: bool = False       # fixes a mistake — scheduled before normal items
+    kind: str = "normal"           # normal | focus (auto-completes on window focus)
+    attempts: int = 0              # boundaries hit while this item was active
+    notes: str = ""                # supervisor notes / failure reason
+
+
+class Plan:
+    """Ordered todo list with stable ids. Selection order: corrective pending
+    items first (insertion order), then normal pending items."""
+
+    def __init__(self) -> None:
+        self._items: List[TodoItem] = []
+        self._next_id = 1
+
+    def items(self) -> List[TodoItem]:
+        return list(self._items)
+
+    def add(self, text: str, *, context: str = "", expected_value: str = "",
+            expected_label: str = "", corrective: bool = False,
+            kind: str = "normal") -> TodoItem:
+        item = TodoItem(
+            id=self._next_id,
+            text=" ".join((text or "").split()),   # keep [TODOS] marker single-line
+            context=(context or "").strip(),
+            expected_value=(expected_value or "").strip(),
+            expected_label=(expected_label or "").strip(),
+            corrective=bool(corrective),
+            kind=kind,
+        )
+        self._next_id += 1
+        self._items.append(item)
+        return item
+
+    def current(self) -> Optional[TodoItem]:
+        for it in self._items:
+            if it.status == "in_progress":
+                return it
+        return None
+
+    def activate_next(self) -> Optional[TodoItem]:
+        """Promote the next pending item (corrective first) to in_progress."""
+        if self.current() is not None:
+            return self.current()
+        pending = [it for it in self._items if it.status == "pending"]
+        if not pending:
+            return None
+        nxt = next((it for it in pending if it.corrective), pending[0])
+        nxt.status = "in_progress"
+        return nxt
+
+    def mark(self, item: TodoItem, status: str, note: str = "") -> None:
+        item.status = status
+        if note:
+            item.notes = note
+
+    def has_open_items(self) -> bool:
+        return any(it.status in ("pending", "in_progress") for it in self._items)
+
+    def get_by_id(self, item_id: int) -> Optional[TodoItem]:
+        return next((it for it in self._items if it.id == item_id), None)
+
+    def find_open_duplicate(self, text: str, expected_value: str = "",
+                            expected_label: str = "") -> Optional[TodoItem]:
+        """An OPEN (pending/in_progress) item duplicating the given one.
+
+        PRECISE matches only: identical normalized text, or an identical
+        non-empty expected value+label pair. Deliberately NO fuzzy text
+        matching — form items are templated ("Fill in the X field with 'Y'"),
+        so near-identical wording with a different field/value is NORMAL, and
+        a fuzzy threshold once classified "Fill in the Last Name field with
+        'Doe'" as a duplicate of the First Name item, silently deleting a
+        required step from the plan. The failure asymmetry rules: a duplicate
+        slipping through costs one redundant verify cycle (and can be swept
+        via obsolete_item_ids); a false drop invisibly removes required work."""
+        norm = " ".join((text or "").lower().split())
+        ev = (expected_value or "").strip().lower()
+        el = (expected_label or "").strip().lower()
+        for it in self._items:
+            if it.status not in ("pending", "in_progress"):
+                continue
+            if norm and norm == " ".join(it.text.lower().split()):
+                return it
+            if (ev and el
+                    and ev == it.expected_value.strip().lower()
+                    and el == it.expected_label.strip().lower()):
+                return it
+        return None
+
+    def pending_corrective(self) -> Optional[TodoItem]:
+        return next((it for it in self._items
+                     if it.corrective and it.status in ("pending", "in_progress")), None)
+
+    def render(self, max_done: int = 6) -> str:
+        """Multi-line view for the supervisor prompt (old completed items elided)."""
+        if not self._items:
+            return "  (empty — nothing planned yet)"
+        closed = [it for it in self._items if it.status in ("done", "failed", "skipped")]
+        shown_closed_ids = {id(it) for it in closed[-max_done:]}
+        hidden = len(closed) - len(shown_closed_ids)
+        lines: List[str] = []
+        if hidden > 0:
+            lines.append(f"  … {hidden} earlier completed item(s) not shown")
+        for it in self._items:
+            if it.status in ("done", "failed", "skipped") and id(it) not in shown_closed_ids:
+                continue
+            extra: List[str] = []
+            if it.corrective:
+                extra.append("CORRECTIVE")
+            if it.expected_value and it.expected_label:
+                extra.append(f"expect '{it.expected_value}' near '{it.expected_label}'")
+            if it.attempts:
+                extra.append(f"attempts={it.attempts}")
+            if it.notes:
+                extra.append(it.notes)
+            suffix = f"  ({'; '.join(extra)})" if extra else ""
+            lines.append(f"  [{it.id}] {_STATUS_GLYPHS.get(it.status, '?')} {it.text}{suffix}")
         return "\n".join(lines)
+
+    def to_marker(self) -> str:
+        """Compact single-line JSON for the [TODOS] log marker (drives the UI)."""
+        return json.dumps(
+            [{"id": it.id, "text": it.text, "status": it.status,
+              "corrective": it.corrective} for it in self._items],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+
+    def export(self) -> List[Dict[str, Any]]:
+        return [asdict(it) for it in self._items]
+
+    def load(self, entries: List[Dict[str, Any]]) -> None:
+        for d in entries:
+            try:
+                item = TodoItem(**d)
+            except TypeError:
+                continue  # tolerate schema drift across versions
+            if item.status == "in_progress":   # process died mid-item — retry it
+                item.status = "pending"
+            self._items.append(item)
+            self._next_id = max(self._next_id, item.id + 1)
+
+
+@dataclass
+class SupervisorState:
+    """The supervisor's running state: fixed goal + the plan it owns."""
+    ultimate_goal: str = ""
+    prior_tasks: List[str] = field(default_factory=list)
+    plan: Plan = field(default_factory=Plan)
+    guidance: str = ""            # one-line hint handed to the actioner with its next item
+    last_assessment: str = ""
+    control: str = "continue"     # continue | ask_user | stop | task_complete
+    control_detail: str = ""
+    final_evidence: List[Dict[str, str]] = field(default_factory=list)
+    last_narration: str = ""      # narrator observation consumed by the next call
+    fail_note: str = ""           # e.g. a rejected task_complete — shown at the next call
+
+
+def render_current_task(item: TodoItem, guidance: str = "") -> str:
+    """The CURRENT TASK block — the ONLY view of the work the actioner gets."""
+    lines = [f"CURRENT TASK (assigned by your supervisor — do ONLY this): {item.text}"]
+    if item.context:
+        lines.append(f"CONTEXT: {item.context}")
+    if item.expected_value and item.expected_label:
+        lines.append(
+            f"EXPECTED OUTCOME: '{item.expected_value}' visible next to "
+            f"'{item.expected_label}'."
+        )
+    elif item.expected_value:
+        lines.append(f"EXPECTED OUTCOME: '{item.expected_value}' visible on screen.")
+    if guidance:
+        lines.append(f"SUPERVISOR GUIDANCE: {guidance}")
+    lines.append(
+        "When the outcome is visible on screen, call subtask_done with verbatim "
+        "OCR evidence. If you cannot complete this task, call subtask_blocked "
+        "with a concrete reason."
+    )
+    return "\n".join(lines)
 
 
 # --- Session persistence (conversation continuity) ------------------------- #
@@ -2465,6 +3064,9 @@ class ComputerAgent:
         self._no_change_streak = 0
         self._last_action_was_wait = False
         self._prev_screenshot: Optional[Image.Image] = None  # raw frame, for pixel-diff highlight
+        # Unchanged-screen fast path: cached result of the last full parse.
+        self._last_elements: Optional[List[Element]] = None
+        self._last_rect: Optional[Tuple[int, int, int, int]] = None
 
     # --- screen parsing --------------------------------------------------- #
 
@@ -2479,14 +3081,57 @@ class ComputerAgent:
         focus/edit a field, where the caret corrupts field text OCR.
         """
         t0 = time.monotonic()
+        caret_centers: List[Tuple[int, int]] = []
         if decaret:
             frames, (win_x, win_y, win_w, win_h) = capture_foreground_burst()
-            screenshot = _decaret(frames)
+            screenshot, caret_centers = _decaret(frames)
         else:
             screenshot, (win_x, win_y, win_w, win_h) = capture_foreground()
         log.info("screenshot: %.2fs (window %dx%d at %d,%d)%s",
                  time.monotonic() - t0, win_w, win_h, win_x, win_y,
                  " [decaret]" if decaret else "")
+
+        # Fast path: BIT-IDENTICAL (RGB-exact) to the previous frame in the same
+        # window rect → OCR/YOLO are deterministic, so their output would be
+        # identical too; reuse the cached elements and skip 4-8s of inference.
+        # Exact equality, deliberately: any tolerance can swallow a real hint
+        # (a single small glyph is <24px; a red→green indicator of equal
+        # luminance is invisible to a grayscale diff), and the cost asymmetry
+        # favors strictness — a false "changed" wastes one parse, a false
+        # "unchanged" hides a real change from the agent. Static-window capture
+        # is deterministic (composited framebuffer), so exactness still fires
+        # in practice. Same-rect required: cached coords are screen-absolute.
+        rect = (win_x, win_y, win_w, win_h)
+        if (self._prev_screenshot is not None and self._last_elements is not None
+                and rect == self._last_rect):
+            a = np.asarray(self._prev_screenshot.convert("RGB"), dtype=np.uint8)
+            b = np.asarray(screenshot.convert("RGB"), dtype=np.uint8)
+            identical = a.shape == b.shape and np.array_equal(a, b)
+            if a.shape == b.shape and not identical:
+                # Diagnostics: a tiny diff defeating the fast path is either a
+                # real small hint (correctly triggering a full parse) or an
+                # animation/healing artifact eating the speedup — make it
+                # visible so the trade-off can be judged from real runs.
+                n_diff = int((a != b).any(axis=2).sum())
+                if n_diff <= 200:
+                    log.info("fast path missed: %d px differ (small hint, animation, "
+                             "or healing artifact) — full parse", n_diff)
+            if identical:
+                log.info("screen unchanged — OCR/YOLO skipped, cached elements reused")
+                self._prev_screenshot = screenshot
+                change = ChangeSet()
+                if caret_centers:
+                    change.caret_xy = (caret_centers[0][0] + win_x,
+                                       caret_centers[0][1] + win_y)
+                annotated = annotate_screenshot(
+                    screenshot, self._last_elements, win_x, win_y,
+                    click_marker=self.executor.last_click_point,
+                )
+                if self.cfg.save_debug_screenshots:
+                    self._save_debug(annotated)
+                buf = BytesIO()
+                annotated.save(buf, format="PNG")
+                return base64.b64encode(buf.getvalue()).decode(), self._last_elements, change
 
         t1 = time.monotonic()
         log.info("Starting OCR + icon detection (parallel) ...")
@@ -2521,11 +3166,25 @@ class ComputerAgent:
         for icon_el in icon_elements:
             icon_box = {"x": icon_el.x, "y": icon_el.y,
                         "w": icon_el.width, "h": icon_el.height}
-            if any(_coverage(icon_box, ob) >= _YOLO_OCR_OVERLAP_THRESH for ob in ocr_boxes):
-                continue  # overlaps an OCR box — skip
+            coverages = [_coverage(icon_box, ob) for ob in ocr_boxes]
+            if any(c >= _YOLO_OCR_OVERLAP_THRESH for c in coverages):
+                # Redundant blue overlay — drop the YOLO box, but FUSE its
+                # meaning onto OCR text that sits mostly inside it: that text
+                # IS a clickable control (filled edit field, labeled button).
+                # Without this the "interactive" information would be lost and
+                # a filled field would look like inert text.
+                for el, cov in zip(ocr_elements, coverages):
+                    if cov >= _YOLO_TEXT_FUSE_THRESH:
+                        el.interactive = True
+                continue
             merged.append(icon_el)
 
         reconciled, change = self.registry.reconcile(merged, self.width, self.height)
+        self._last_elements = reconciled     # cache for the unchanged-screen fast path
+        self._last_rect = rect
+        if caret_centers:
+            # Surface the (healed-away) caret as a focus indicator, screen-absolute.
+            change.caret_xy = (caret_centers[0][0] + win_x, caret_centers[0][1] + win_y)
 
         # Pixel-diff highlight: mark what changed since the previous frame — but
         # skip on scroll/replaced, where "everything" changed and a wash is noise.
@@ -2564,8 +3223,13 @@ class ComputerAgent:
             log.debug("debug screenshot save failed: %s", exc)
 
     @staticmethod
-    def _format_elements(elements: List[Element], limit: int = 200) -> str:
-        """Format elements into two labeled sections: OCR text and YOLO icons."""
+    def _format_elements(elements: List[Element], limit: int = 200,
+                         include_yolo: bool = True) -> str:
+        """Format elements into two labeled sections: OCR text and YOLO icons.
+
+        include_yolo=False omits the INTERACTIVE REGIONS section — YOLO lines
+        carry no text, so they are pure prefill cost for roles that never click
+        (the supervisor plans from labels/values, not from anonymous boxes)."""
         ocr_els = sorted(
             [el for el in elements if el.source != "yolo"],
             key=lambda el: (el.center_y // 16, el.center_x),
@@ -2583,7 +3247,7 @@ class ComputerAgent:
             "OCR TEXT ELEMENTS:\n" + ("\n".join(ocr_lines) if ocr_lines else "(none)")
         )
 
-        if yolo_els:
+        if yolo_els and include_yolo:
             yolo_limit = 100
             yolo_lines = [el.as_prompt_line() for el in yolo_els[:yolo_limit]]
             if len(yolo_els) > yolo_limit:
@@ -2638,11 +3302,11 @@ class ComputerAgent:
 
     def _call_llm(
         self, messages: List[dict], tools: Optional[List[dict]] = None,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = None, model: Optional[str] = None,
     ) -> dict:
         self._dump_context(messages)
         payload = {
-            "model": self.cfg.model,
+            "model": model or self.cfg.model,
             "messages": messages,
             "tools": tools if tools is not None else COMPUTER_TOOLS,
             "tool_choice": "auto",
@@ -2670,52 +3334,65 @@ class ComputerAgent:
                 time.sleep(wait)
         raise RuntimeError(f"LLM call failed after {self.cfg.request_retries + 1} attempts: {last_exc}")
 
-    # --- navigator (goal-holding critic) ---------------------------------- #
+    # --- supervisor (plan-owning controller) ------------------------------- #
 
-    def _navigate(
+    def _supervise(
         self,
-        nav: "NavigatorState",
+        sup: "SupervisorState",
+        boundary: str,
         change: ChangeSet,
         trail: ProgressTrail,
+        elements: List[Element],
         elements_text: str,
         tokens: Dict[str, int],
-    ) -> None:
-        """Re-assess progress toward the ultimate goal from a neutral, text-only
-        outside viewpoint, and update `nav` in place (objective + guidance). Runs
-        in its own short context (not the actioner's history) — cheap, and the
-        separation is what gives the 'neutral outside view'. Never executes input.
-        """
-        narration_block = (
-            f"VISUAL OBSERVATION (from the narrator): {nav.last_narration}\n\n"
-            if nav.last_narration else ""
-        )
+    ) -> bool:
+        """One supervisor round at a sub-task boundary: present the event, the
+        plan, and the screen; apply the resulting update_plan (verdict, new
+        items, control) to `sup` in place. Runs in its own short context —
+        the information asymmetry (the actioner never sees the goal or the
+        plan) is what makes the hierarchy real. Returns False if the LLM call
+        failed (plan left unchanged)."""
         prior_block = (
             f"EARLIER REQUESTS IN THIS CONVERSATION (already handled): "
-            f"{'; '.join(nav.prior_tasks)}\n"
-            if nav.prior_tasks else ""
+            f"{'; '.join(sup.prior_tasks)}\n\n"
+            if sup.prior_tasks else ""
         )
-        user = (
-            f"{prior_block}"
-            f"ULTIMATE GOAL (current request): {nav.ultimate_goal}\n"
-            f"CURRENT OBJECTIVE: {nav.current_intent or '(none yet — set the first objective)'}\n\n"
-            f"{change.render()}\n\n"
-            f"{narration_block}"
-            f"{trail.render() or 'PROGRESS SO FAR: (nothing done yet)'}\n\n"
-            f"CURRENT SCREEN ELEMENTS:\n{elements_text}\n\n"
-            "Assess progress toward the ULTIMATE GOAL and set the next objective."
+        parts: List[str] = [
+            f"{prior_block}ULTIMATE GOAL (the user's request): {sup.ultimate_goal}",
+            f"TODO LIST (your plan — the actioner sees ONLY the ▶ item):\n{sup.plan.render()}",
+            f"WHY YOU ARE CALLED NOW: {boundary}",
+        ]
+        if sup.fail_note:
+            parts.append(f"⚠ {sup.fail_note}")
+            sup.fail_note = ""
+        change_block = change.render()
+        if change_block:
+            parts.append(change_block)
+        if sup.last_narration:
+            parts.append(f"VISUAL OBSERVATION (from the narrator): {sup.last_narration}")
+            sup.last_narration = ""
+        parts.append(trail.render(limit=20) or "PROGRESS SO FAR: (nothing done yet)")
+        # Full element view (OCR + interactive regions): after OCR/YOLO fusion
+        # the surviving <interactive> lines are mostly EMPTY fields and icon
+        # buttons — exactly the "what could be filled/clicked next" signal a
+        # planner needs, and there are few of them, so the token cost is small.
+        parts.append(f"CURRENT SCREEN ELEMENTS:\n{elements_text}")
+        parts.append(
+            "Call update_plan exactly once: verdict on the ▶ item, extend/revise "
+            "the plan if needed, and set control."
         )
-        nav.last_narration = ""  # consumed — don't carry a stale narration forward
         messages = [
-            {"role": "system", "content": NAVIGATOR_SYSTEM_PROMPT},
-            {"role": "user", "content": user},
+            {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(parts)},
         ]
         try:
             resp = self._call_llm(
-                messages, tools=NAVIGATOR_TOOLS, max_tokens=self.cfg.navigator_max_tokens
+                messages, tools=SUPERVISOR_TOOLS, max_tokens=self.cfg.navigator_max_tokens,
+                model=self.cfg.navigator_model,
             )
         except Exception as exc:
-            log.warning("Navigator call failed (%s) — keeping previous objective.", exc)
-            return
+            log.warning("Supervisor call failed (%s) — plan unchanged.", exc)
+            return False
 
         tokens["calls"] += 1
         if "usage" in resp:
@@ -2724,33 +3401,281 @@ class ComputerAgent:
             tokens["output"] += u.get("completion_tokens", 0)
             tokens["total"] += u.get("total_tokens", 0)
 
-        tcs = (resp["choices"][0]["message"].get("tool_calls") or [])
-        if not tcs:
-            log.info("[NAV] no assessment returned — keeping objective %r", nav.current_intent)
-            return
-        try:
-            args = json.loads(tcs[0]["function"]["arguments"] or "{}")
-        except json.JSONDecodeError:
-            args = {}
-
-        nav.last_status = (args.get("status") or "").strip()
-        nav.last_reasoning = (args.get("reasoning") or "").strip()
-        next_intent = (args.get("next_intent") or "").strip()
-        if next_intent:
-            nav.current_intent = next_intent
-        nav.guidance = (args.get("guidance") or "").strip()
-        if nav.last_status == "goal_reached" and not nav.guidance:
-            nav.guidance = (
-                "Navigator believes the goal is reached — if you can cite OUTCOME "
-                "evidence visible on screen, call finish_task; otherwise keep working."
-            )
-        if nav.last_status in ("off_track", "stuck"):
-            nav.stuck_rounds += 1
+        sup_choice = resp["choices"][0]
+        sup_msg = sup_choice["message"]
+        tcs = sup_msg.get("tool_calls") or []
+        if tcs:
+            try:
+                args = json.loads(tcs[0]["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
         else:
-            nav.stuck_rounds = 0
+            # Fallback: smaller models sometimes emit the update_plan JSON as
+            # plain text instead of a proper tool call. Recover it rather than
+            # stalling the run on a silent no-op.
+            known = frozenset({"assessment", "current_item_verdict", "add_items", "control"})
+            args = _extract_tool_args_from_content(sup_msg.get("content") or "", known)
+            if not (isinstance(args, dict) and known & set(args.keys())):
+                snippet = " ".join((sup_msg.get("content") or "").split())[:180]
+                finish = sup_choice.get("finish_reason") or "?"
+                # finish_reason distinguishes truncation ('length' → raise
+                # navigator_max_tokens) from a genuinely empty/prose reply.
+                log.info("[INTERVENE] supervisor produced no usable update_plan — plan unchanged "
+                         "(finish_reason=%s%s)", finish,
+                         f", said: {snippet!r}" if snippet else ", empty content")
+                return False
+            log.info("supervisor update_plan recovered from text content")
 
-        log.info("[NAV] %s | %s", nav.last_status or "?", nav.last_reasoning)
-        log.info("[NAV] → objective: %s", nav.current_intent)
+        sup.last_assessment = (args.get("assessment") or "").strip()
+        verdict = (args.get("current_item_verdict") or "no_current_item").strip().lower()
+        verdict_reason = (args.get("verdict_reason") or "").strip()
+
+        # Verdict on the current item — with a label-anchored override: a 'done'
+        # tick on an item with a machine-checkable expected outcome must pass
+        # geometry, no matter what the supervisor believes.
+        cur = sup.plan.current()
+        if cur is not None and verdict in ("done", "failed", "not_done"):
+            if verdict == "done" and cur.expected_value and cur.expected_label:
+                v, detail = check_value_near_label(
+                    cur.expected_value, cur.expected_label, elements
+                )
+                if v == "fail":
+                    log.info("[INTERVENE] done-verdict overridden by label-anchored check: %s", detail)
+                    verdict = "not_done"
+                    verdict_reason = f"machine check failed: {detail}"
+            if verdict == "done":
+                sup.plan.mark(cur, "done", verdict_reason)
+                log.info("[TODO] ✓ %s", cur.text)
+            elif verdict == "failed":
+                sup.plan.mark(cur, "failed", verdict_reason or "abandoned by supervisor")
+                log.info("[TODO] ✗ %s", cur.text)
+            else:
+                cur.attempts += 1
+                if verdict_reason:
+                    cur.notes = verdict_reason
+
+        # New items (corrective ones are scheduled before all normal work).
+        # DEDUP: some models re-emit their whole remaining frontier every round;
+        # an item duplicating an OPEN one is dropped, never queued twice.
+        corrective_added = False
+        for entry in (args.get("add_items") or []):
+            if not isinstance(entry, dict):
+                continue
+            text = (entry.get("text") or "").strip()
+            if not text:
+                continue
+            dup = sup.plan.find_open_duplicate(
+                text, entry.get("expected_value") or "", entry.get("expected_label") or ""
+            )
+            if dup is not None:
+                log.info("[TODO] ≈ dropped duplicate of open item [%d]: %s", dup.id, text)
+                continue
+            item = sup.plan.add(
+                text,
+                context=entry.get("context") or "",
+                expected_value=entry.get("expected_value") or "",
+                expected_label=entry.get("expected_label") or "",
+                corrective=bool(entry.get("corrective")),
+            )
+            corrective_added = corrective_added or item.corrective
+            log.info("[TODO] + %s%s", "⚠ " if item.corrective else "", item.text)
+
+        # Close items the supervisor declares obsolete (duplicate, superseded,
+        # or already satisfied by completed work). This is the ONLY way to clear
+        # leftovers other than working them — without it, one stale item forces
+        # a full (and possibly DANGEROUS) redundant work cycle, because the
+        # completion gate rightly refuses to finish while items are open.
+        for oid in (args.get("obsolete_item_ids") or []):
+            try:
+                oid = int(oid)
+            except (TypeError, ValueError):
+                continue
+            item = sup.plan.get_by_id(oid)
+            if item is not None and item.status in ("pending", "in_progress"):
+                sup.plan.mark(item, "skipped", "obsolete — closed by supervisor")
+                log.info("[TODO] − %s (obsolete)", item.text)
+
+        # Corrective work PREEMPTS: suspend the active normal item so
+        # activate_next() picks the corrective item first; the suspended item
+        # is re-activated (pending) once corrections are done.
+        if corrective_added:
+            active = sup.plan.current()
+            if active is not None and not active.corrective:
+                active.status = "pending"
+                log.info("[TODO] ⏸ %s (preempted by corrective item)", active.text)
+
+        sup.guidance = (args.get("guidance") or "").strip()
+        control = (args.get("control") or "continue").strip().lower()
+        if control not in ("continue", "ask_user", "stop", "task_complete"):
+            control = "continue"
+        sup.control = control
+        sup.control_detail = (args.get("control_detail") or "").strip()
+        sup.final_evidence = [
+            e for e in (args.get("final_evidence") or []) if isinstance(e, dict)
+        ]
+
+        # UI status pill + assessment line.
+        if control == "task_complete":
+            ui_status = "goal_reached"
+        elif verdict == "failed" or "ALARM" in boundary:
+            ui_status = "off_track"
+        elif "STUCK" in boundary or "BUDGET" in boundary:
+            ui_status = "stuck"
+        else:
+            ui_status = "on_track"
+        log.info("[NAV] %s | %s", ui_status, sup.last_assessment or verdict_reason or boundary)
+        log.info("[TODOS] %s", sup.plan.to_marker())
+        corrective = sup.plan.pending_corrective()
+        log.info("[ISSUE] %s", corrective.text if corrective else "")  # empty clears the UI
+        return True
+
+    def _boundary_round(
+        self,
+        sup: "SupervisorState",
+        boundary: str,
+        change: ChangeSet,
+        trail: ProgressTrail,
+        elements: List[Element],
+        elements_text: str,
+        tokens: Dict[str, int],
+        actions_log: List[Dict[str, Any]],
+        iteration_no: int,
+    ) -> str:
+        """Run a supervisor round and act on its control decision.
+        Returns 'continue' | 'ask_user' | 'stop' | 'complete'."""
+        # Surface the round in the activity timeline BEFORE the (potentially
+        # slow) LLM call, so a long supervisor think never looks like a hang.
+        log.info("[SUPERVISE] %s", " ".join(boundary.split())[:220])
+        if not self._supervise(sup, boundary, change, trail, elements, elements_text, tokens):
+            log.info("[INTERVENE] supervisor round failed — continuing with the current plan")
+            return "continue"  # keep working the current plan
+
+        if sup.control == "ask_user":
+            question = sup.control_detail or "The supervisor needs more information to proceed."
+            sup.control_detail = question
+            log.info("[INTERVENE] ask_user: %s", question)
+            log.info("[QUESTION] %s", question)
+            actions_log.append({
+                "iteration": iteration_no,
+                "action": "supervisor_ask_user",
+                "question": question,
+                "reason": sup.last_assessment,
+            })
+            return "ask_user"
+
+        if sup.control == "stop":
+            reason = sup.control_detail or sup.last_assessment or "supervisor stopped the run"
+            log.error("Supervisor stop: %s", reason)
+            log.info("[INTERVENE] stop: %s", reason)
+            actions_log.append({
+                "iteration": iteration_no,
+                "error": f"aborted: supervisor stop — {reason}",
+            })
+            return "stop"
+
+        if sup.control == "task_complete":
+            if sup.plan.has_open_items():
+                open_ids = [it.id for it in sup.plan.items()
+                            if it.status in ("pending", "in_progress")]
+                sup.fail_note = (
+                    f"Your previous task_complete was REJECTED: items {open_ids} are "
+                    "still open. Work them — or, if they are duplicates/superseded/"
+                    "already satisfied by completed work, close them by listing their "
+                    "ids in obsolete_item_ids TOGETHER WITH task_complete."
+                )
+                log.info("[INTERVENE] task_complete rejected — open items remain: %s", open_ids)
+                return "continue"
+            ok, detail = self._check_final_evidence(sup.final_evidence, elements)
+            if not ok:
+                sup.fail_note = (
+                    f"Your previous task_complete was REJECTED — {detail}. Either the "
+                    "work is not actually done (add items to finish it) or you must "
+                    "cite different evidence that is really on screen."
+                )
+                log.info("[INTERVENE] task_complete rejected — %s", detail)
+                return "continue"
+            claim = sup.control_detail or sup.last_assessment or "Task completed."
+            actions_log.append({
+                "iteration": iteration_no,
+                "action": "task_complete",
+                "claim": claim,
+                "evidence": [(e.get("value") or "") for e in sup.final_evidence],
+                "verified": True,
+                "reason": f"supervisor completion — {detail}",
+            })
+            log.info("[TASK_RESULT] %s", claim)
+            return "complete"
+
+        return "continue"
+
+    @staticmethod
+    def _check_final_evidence(
+        evidence: List[Dict[str, str]], elements: List[Element]
+    ) -> Tuple[bool, str]:
+        """Machine-check the supervisor's final evidence against the current OCR.
+
+        PRESENCE is the hard requirement — a value not on screen means the
+        completion is hallucinated and is rejected. Label adjacency is checked
+        when a label is given, but a location mismatch only downgrades to a
+        note: the spatial guarantee against wrong-field edits was already
+        enforced at item-tick time (and by the wrong-field guard); values also
+        legitimately appear away from 'their' label (page titles, merged OCR
+        boxes, list rows), so failing completion on location here produces
+        false rejections, not safety."""
+        entries = [e for e in evidence if (e.get("value") or "").strip()]
+        if not entries:
+            return False, "no final_evidence values provided"
+        details: List[str] = []
+        for e in entries:
+            value = e["value"].strip()
+            label = (e.get("label") or "").strip()
+            present, _d = check_evidence_in_ocr([value], elements)
+            if not present:
+                return False, f"value '{value}' not found in current OCR"
+            if label:
+                verdict, detail = check_value_near_label(value, label, elements)
+                if verdict == "pass":
+                    details.append(detail)
+                else:
+                    details.append(f"'{value}' present (location vs '{label}' unverified: {detail})")
+            else:
+                details.append(f"'{value}' present")
+        return True, "; ".join(details)
+
+    def _verify_subtask_claim(
+        self,
+        item: Optional[TodoItem],
+        evidence: List[str],
+        elements: List[Element],
+    ) -> Tuple[bool, str]:
+        """Machine-verify an actioner subtask_done claim against the FRESH OCR:
+        presence of its cited evidence, plus the item's label-anchored expected
+        outcome when defined. Pure checks — no LLM call."""
+        evidence = [e for e in evidence if (e or "").strip()]
+        if not evidence:
+            return False, (
+                "Claim REJECTED: no evidence cited. Call subtask_done again with "
+                "1-4 verbatim OCR snippets that prove this task's outcome."
+            )
+        ok, details = check_evidence_in_ocr(evidence, elements)
+        log_evidence_summary(evidence, details)
+        if not ok:
+            return False, format_evidence_rejection(details)
+        if item is not None and item.expected_value and item.expected_label:
+            verdict, detail = check_value_near_label(
+                item.expected_value, item.expected_label, elements
+            )
+            log.info("label-anchored check: %s — %s", verdict, detail)
+            if verdict == "fail":
+                return False, (
+                    f"Evidence check FAILED (wrong location): {detail}. The expected "
+                    f"outcome is '{item.expected_value}' next to '{item.expected_label}'. "
+                    "Fix this before declaring the task done."
+                )
+            if verdict == "no_label":
+                return True, f"evidence found on screen ({detail})"
+            return True, detail
+        return True, "evidence found on screen"
 
     def _narrate(self, screenshot_b64: str, change: ChangeSet, tokens: Dict[str, int]) -> str:
         """On-demand VLM observer: describe visual/state changes the deterministic
@@ -2771,8 +3696,11 @@ class ComputerAgent:
             {"role": "user", "content": user_content},
         ]
         try:
+            # 1-3 sentences of observation — 300 tokens is plenty; don't inherit
+            # the supervisor's larger planning budget.
             resp = self._call_llm(
-                messages, tools=NARRATOR_TOOLS, max_tokens=self.cfg.navigator_max_tokens
+                messages, tools=NARRATOR_TOOLS,
+                max_tokens=min(300, self.cfg.navigator_max_tokens),
             )
         except Exception as exc:
             log.warning("Narrator call failed (%s).", exc)
@@ -2813,6 +3741,8 @@ class ComputerAgent:
         self._last_ocr_signature = None
         self._last_action_was_wait = False
         self._prev_screenshot = None
+        self._last_elements = None
+        self._last_rect = None
         self.registry = ElementRegistry()
         self.executor = ActionExecutor(self.width, self.height, self.registry)
 
@@ -2837,62 +3767,144 @@ class ComputerAgent:
             res = self.executor._focus_window(target_window)
             log.info("[FOCUS] startup re-focus of %r → %s", target_window, res)
 
-        screenshot_b64, elements, _ = self._parse_screen()  # first frame: no change-set
+        # First frame (no change-set). Decaret is ON: on a continued conversation
+        # a field may still be focused from the previous request, and on a fresh
+        # one the user just typed into the chat input — either way a blinking
+        # caret can corrupt the very OCR the supervisor plans from (a caret
+        # after 'Doe-Doe' once read as 'Doe-Doel' and spawned a phantom
+        # corrective item).
+        screenshot_b64, elements, change = self._parse_screen(decaret=True)
         elements_text = self._format_elements(elements)
         self._last_ocr_signature = ocr_signature(elements)
-
-        history = ConversationHistory(
-            SYSTEM_PROMPT,
-            keep_recent=self.cfg.keep_recent_exchanges,
-            keep_tool_turns=self.cfg.keep_tool_turns,
-        )
 
         actions_log: List[Dict[str, Any]] = []
         tokens = {"input": 0, "output": 0, "total": 0, "calls": 0}
         trail = ProgressTrail()
         trail.load(session.get("trail", []))  # continuity: prior actions/thoughts/outcomes
         nudge_count = 0
-        pending_question: Optional[str] = None  # set if the model calls ask_user
+        pending_question: Optional[str] = None  # set if the supervisor asks the user
+        text_only_streak = 0                    # consecutive turns with no tool call (honest-abort guard)
 
-        # Navigator: set the first objective from the goal + the current screen,
-        # then prepend it to the actioner's first observation.
-        nav: Optional[NavigatorState] = None
-        if self.cfg.use_navigator:
-            nav = NavigatorState(ultimate_goal=instruction, prior_tasks=prior_tasks)
-            if self.executor.focused_once:
-                # Grounded in the real app (continued conversation, or a startup
-                # re-focus succeeded): let the navigator set the first objective
-                # from the actual screen.
-                self._navigate(nav, ChangeSet(), trail, elements_text, tokens)
-            else:
-                # Fresh conversation: the first frame is pre-focus (often the
-                # agent's own UI), so the navigator would fabricate a bogus
-                # objective like "click [e1]". Seed a fixed focus-first objective
-                # instead; the navigator re-assesses in-loop once the correct
-                # application is focused.
-                nav.current_intent = (
-                    "Bring the correct application for this request to the foreground FIRST "
-                    "(focus_window, or open_application if it is not running). If it is unclear "
-                    "which application the request refers to, ask_user. Do not click or type "
-                    "until the right application is focused."
+        if not self.cfg.use_navigator:
+            log.warning("NAVIGATOR=0 requested, but the supervisor is integral to "
+                        "this architecture — it stays enabled.")
+
+        # Supervisor state: owns the plan (todo list). The plan is persisted per
+        # conversation, so a follow-up request continues an existing plan.
+        sup = SupervisorState(ultimate_goal=instruction, prior_tasks=prior_tasks)
+        sup.plan.load(session.get("todos", []))
+
+        run_over = False       # a terminal control decision was taken pre-loop
+        task_done = False
+        empty_plan_rounds = 0
+
+        # --- Bootstrap the plan -------------------------------------------- #
+        if not self.executor.focused_once:
+            # Fresh conversation: the first frame is pre-focus (often the agent's
+            # own UI), so a supervisor plan drawn from it would be bogus. Seed a
+            # deterministic focus item — it auto-completes the moment a window
+            # focus succeeds, and THAT boundary hands the supervisor a real
+            # screen to plan the actual work from.
+            if not any(it.kind == "focus" and it.status == "pending"
+                       for it in sup.plan.items()):
+                sup.plan.add(
+                    "Bring the correct application for the user's request to the "
+                    "foreground: use list_windows / focus_window, or "
+                    "open_application if it is not running. Do not click or type "
+                    "before that.",
+                    context=(f"The user's request is: '{instruction}'. Derive the right "
+                             "application from it. If genuinely ambiguous, call "
+                             "subtask_blocked."),
+                    kind="focus",
+                    corrective=True,
                 )
-            initial_text = nav.render_for_actioner() + "\n\n" + elements_text
+            log.info("[TODOS] %s", sup.plan.to_marker())
         else:
-            initial_text = elements_text
-
-        # On a continued conversation, front-load the memory so the actioner
-        # knows it is mid-conversation and sees everything it already did.
-        if continuing:
-            prior = "; ".join(prior_tasks)
-            initial_text = (
-                f"(CONTINUING CONVERSATION. Earlier requests you already handled: {prior}. "
-                f"The screen is where that work left off; your full action history is below.)\n\n"
-                f"{trail.render()}\n\n" + initial_text
+            # Grounded in the real app (continued conversation, or the startup
+            # re-focus succeeded): let the supervisor plan from the actual screen.
+            outcome = self._boundary_round(
+                sup, "NEW USER REQUEST — assess the current screen and plan the work. "
+                     "No pending item covers this request yet: you MUST add_items for it "
+                     "IN THIS RESPONSE (or complete/stop). An update without add_items "
+                     "is a wasted round. If you spot a problem on screen (wrong value, "
+                     "open dialog), the fix must itself be an added item.",
+                change, trail, elements, elements_text, tokens, actions_log, 0,
             )
-        history.add_initial_user(instruction, initial_text, screenshot_b64)
+            if outcome == "ask_user":
+                pending_question = sup.control_detail
+                run_over = True
+            elif outcome == "stop":
+                run_over = True
+            elif outcome == "complete":
+                task_done = True
+                run_over = True
 
+        # Activate the first item (re-asking the supervisor if the plan is empty).
+        current_item: Optional[TodoItem] = None
+        while not run_over:
+            current_item = sup.plan.activate_next()
+            if current_item is not None:
+                break
+            empty_plan_rounds += 1
+            if empty_plan_rounds > 3:
+                log.error("Supervisor produced no actionable items — aborting.")
+                actions_log.append({"iteration": 0,
+                                    "error": "aborted: supervisor produced no plan"})
+                run_over = True
+                break
+            if empty_plan_rounds > 1:
+                # Feedback beats standing instructions: tell the model its last
+                # response was discarded, not just what the rules are.
+                sup.fail_note = (
+                    "REJECTED: your previous update added no usable items while "
+                    "control was 'continue'. The actioner is IDLE and nothing will "
+                    "happen until you act. Respond NOW with add_items (at least one "
+                    "concrete item), or set control to task_complete/stop."
+                )
+            outcome = self._boundary_round(
+                sup, "NO PENDING ITEMS — the actioner has nothing to do. You MUST respond "
+                        "with add_items (at least one concrete item), or set control to "
+                        "task_complete/stop. Assessing without adding items is a wasted "
+                        "round and will simply be retried.",
+                change, trail, elements, elements_text, tokens, actions_log, 0,
+            )
+            if outcome == "ask_user":
+                pending_question = sup.control_detail
+                run_over = True
+            elif outcome == "stop":
+                run_over = True
+            elif outcome == "complete":
+                task_done = True
+                run_over = True
+
+        history = ConversationHistory(
+            SYSTEM_PROMPT,
+            keep_recent=self.cfg.keep_recent_exchanges,
+            keep_tool_turns=self.cfg.keep_tool_turns,
+        )
+        if current_item is not None:
+            log.info("[NAV] → objective: %s", current_item.text)
+            log.info("[TODOS] %s", sup.plan.to_marker())
+            task_block = render_current_task(current_item, sup.guidance)
+            sup.guidance = ""
+            initial_text = elements_text
+            # On a continued conversation, front-load the memory so the actioner
+            # knows it is mid-conversation and sees everything it already did.
+            if continuing:
+                prior = "; ".join(prior_tasks)
+                initial_text = (
+                    f"(CONTINUING CONVERSATION. Earlier requests you already handled: {prior}. "
+                    f"The screen is where that work left off; your full action history is below.)\n\n"
+                    f"{trail.render()}\n\n" + initial_text
+                )
+            history.add_initial_user(task_block, initial_text, screenshot_b64)
+
+        subtask_iters = 0   # actioner iterations spent on the current item
         for iteration in range(self.cfg.max_iterations):
+            if run_over:
+                break
             log.info("--- iteration %d ---", iteration + 1)
+            log.info("[ITER] %d", iter_base + iteration + 1)  # timeline group boundary
 
             try:
                 response = self._call_llm(history.messages_for_api())
@@ -2916,24 +3928,40 @@ class ComputerAgent:
             if not tool_calls:
                 text = (msg.get("content") or "").strip()
                 log.info("Model text (no tool call): %s", text[:200])
-                if any(p in text.lower() for p in ("task is complete", "task complete", "done")):
-                    log.info("Model indicates completion in text — stopping.")
+                # NO free-text completion: declaring "done"/"complete" in prose used
+                # to break here, bypassing the evidence check — that caused false
+                # completions (and misfires when the server's tool-call parser leaks
+                # a call into content). Completion MUST go through subtask_done, which
+                # is evidence-checked. If the model never issues a tool call, abort
+                # honestly rather than claim success.
+                text_only_streak += 1
+                if text_only_streak >= 4:
+                    log.error("Model returned no tool call %d turns in a row — aborting "
+                              "(check the server's tool-call parser).", text_only_streak)
+                    actions_log.append({
+                        "iteration": iteration + 1,
+                        "error": "aborted: model issued no tool calls (server tool-call parser?)",
+                    })
                     break
+                nudge = ("You did not issue a tool call — every step MUST be a tool call. "
+                         "If you believe the CURRENT TASK is finished, call subtask_done and cite OUTCOME "
+                         "evidence currently visible on screen; otherwise take the next concrete action.")
                 nudge_count += 1
                 if nudge_count >= 2:
                     log.info("Re-parsing screen after repeated text-only responses.")
                     screenshot_b64, elements, _ = self._parse_screen()
                     note = trail.render()
-                    note = (note + "\n\n" if note else "") + \
-                           "Please issue a tool call to make progress. Include a 'thought'."
+                    note = (note + "\n\n" if note else "") + nudge
                     history.add_observation(self._format_elements(elements), screenshot_b64, note=note)
                     nudge_count = 0
                 else:
-                    history.add_nudge("Please issue a tool call with a 'thought' to make progress.")
+                    history.add_nudge(nudge)
                 continue
+            text_only_streak = 0  # got a tool call — reset the no-tool-call counter
 
             nudge_count = 0
-            task_done = False
+            boundary: Optional[str] = None       # supervisor boundary reason (this iteration)
+            pending_claim: Optional[Dict[str, Any]] = None  # subtask_done awaiting verification
             iteration_actions: List[Tuple[str, Dict[str, Any], str]] = []  # (fn_name, args, result)
             pre_action_elements = {el.stable_id: el for el in elements}  # capture before actions change the screen
 
@@ -2948,67 +3976,40 @@ class ComputerAgent:
                 if thought:
                     log.info("[THOUGHT] %s", thought)
 
+                # Legacy aliases (older prompts/persisted habits) map onto the
+                # new sub-task tools so the run degrades gracefully.
                 if fn_name in ("finish_task", "task_complete"):
+                    fn_name = "subtask_done"
+                if fn_name == "ask_user":
+                    fn_name = "subtask_blocked"
+                    args.setdefault("reason", args.get("question", ""))
+
+                if fn_name == "subtask_done":
                     claim = args.get("message", "")
                     evidence = args.get("evidence") or []
                     if not isinstance(evidence, list):
                         evidence = [str(evidence)]
-
-                    # Cheap check first: does the model's own evidence appear in the current OCR?
-                    evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
-                    log_evidence_summary(evidence, ev_details)
-
-                    if not evidence_ok:
-                        rejection = format_evidence_rejection(ev_details)
-                        history.add_tool_result(tc["id"], rejection)
-                        actions_log.append({
-                            "iteration": iteration + 1,
-                            "action": "task_complete",
-                            "claim": claim,
-                            "evidence": evidence,
-                            "evidence_check": ev_details,
-                            "verified": False,
-                            "reason": "evidence not found in current OCR",
-                            "thought": thought,
-                        })
-                        # Do NOT break — the model should keep working. The rejection
-                        # is now in its context and the trail will record this attempt.
-                        iteration_actions.append((fn_name, args, "evidence check failed"))
-                        continue
-
-                    # Evidence cleared the cheap check. Escalate to LLM verification.
-                    verified, reason = self._verify_completion(
-                        instruction, claim, evidence, history, tokens, trail
+                    pending_claim = {"claim": claim, "evidence": evidence, "thought": thought}
+                    history.add_tool_result(
+                        tc["id"], "claim received — verifying against a fresh screenshot."
                     )
-                    history.add_tool_result(tc["id"], f"verification: {reason}")
+                    iteration_actions.append((fn_name, args, "verifying claim"))
+                    break  # nothing may run after a completion claim
+
+                if fn_name == "subtask_blocked":
+                    reason = (args.get("reason") or "").strip() or "(no reason given)"
+                    history.add_tool_result(
+                        tc["id"], "reported blocked — the supervisor will replan."
+                    )
                     actions_log.append({
                         "iteration": iteration + 1,
-                        "action": "task_complete",
-                        "claim": claim,
-                        "evidence": evidence,
-                        "evidence_check": ev_details,
-                        "verified": verified,
+                        "action": "subtask_blocked",
                         "reason": reason,
                         "thought": thought,
                     })
-                    if verified:
-                        if claim.strip():
-                            log.info("[TASK_RESULT] %s", claim.strip())
-                        task_done = True
-                    break
-
-                if fn_name == "ask_user":
-                    question = (args.get("question") or "").strip()
-                    log.info("[QUESTION] %s", question)
-                    history.add_tool_result(tc["id"], "asked the user; ending run to await their reply.")
-                    actions_log.append({
-                        "iteration": iteration + 1,
-                        "action": "ask_user",
-                        "question": question,
-                        "thought": thought,
-                    })
-                    pending_question = question
-                    task_done = True  # end the run; the user's reply continues this conversation
+                    iteration_actions.append((fn_name, args, f"blocked: {reason}"))
+                    item_txt = current_item.text if current_item else "(no active item)"
+                    boundary = f"ACTIONER BLOCKED on item '{item_txt}': {reason}"
                     break
 
                 action_type = "type" if fn_name == "type_text" else fn_name
@@ -3016,7 +4017,7 @@ class ComputerAgent:
                 exec_args = {k: v for k, v in args.items() if k != "thought"}
                 result = self.executor.execute(action_type, exec_args)
                 log.info("   %s", result)
-                history.add_tool_result(tc["id"], result)
+                log.info("[RESULT] %s", result)  # timeline: outcome of the action above
                 actions_log.append({
                     "iteration": iteration + 1,
                     "action": fn_name,
@@ -3024,29 +4025,36 @@ class ComputerAgent:
                     "result": result,
                     "thought": thought,
                 })
+                history.add_tool_result(tc["id"], result)
                 iteration_actions.append((fn_name, args, result))
 
             # Enforce the assistant.tool_calls <-> tool.tool_call_id invariant:
-            # any tool_calls we broke out of (e.g. after finish_task) or didn't
+            # any tool_calls we broke out of (e.g. after subtask_done) or didn't
             # recognize must still have a placeholder tool response or the next
             # API call will 400.
             dangling = history.ensure_tool_results_for(tool_calls)
             if dangling:
                 log.debug("Added %d placeholder tool results for unprocessed calls", dangling)
 
-            if task_done:
-                break
-
             # Observe new screen state. If an action this turn focused or edited
             # a field, a text caret is likely — remove it before OCR (decaret).
+            # A pending completion claim also forces decaret: its evidence is
+            # typically a value in a still-focused field.
             time.sleep(0.2)
             self.executor.tick_click_age()
             did_edit = any(a in _CARET_INDUCING_ACTIONS for a, _, _ in iteration_actions)
-            screenshot_b64, elements, change = self._parse_screen(decaret=did_edit)
+            # Snapshot of what the actioner was looking at when it acted/claimed —
+            # transient confirmations (toasts) can fade during the claim
+            # round-trip, so a pending claim may need to be checked against this.
+            claim_time_elements = elements
+            screenshot_b64, elements, change = self._parse_screen(
+                decaret=did_edit or pending_claim is not None
+            )
             log.info("[CHANGE] %s", change.summary())
             new_sig = ocr_signature(elements)
             screen_changed = new_sig != self._last_ocr_signature
             self._last_ocr_signature = new_sig
+            log.info("[PROGRESS] %s", "changed" if screen_changed else "nochange")  # timeline badge
 
             # Wait-aware stuck counter: don't count iterations where the model's
             # ONLY action was wait(). Any non-wait action ticks the counter.
@@ -3056,6 +4064,64 @@ class ComputerAgent:
             elif had_non_wait_action:
                 self._no_change_streak += 1
             # (else: only waits this turn, don't tick)
+
+            # --- Verify a pending completion claim (machine check, no LLM) --- #
+            # Runs BEFORE trail recording so the trail shows the claim's OUTCOME,
+            # not a dangling 'verifying claim' — the actioner reads the trail and
+            # otherwise invents a failure narrative ("my claim was premature")
+            # for claims that actually passed and advanced the plan.
+            claim_note = ""
+            if pending_claim is not None:
+                verified, detail = self._verify_subtask_claim(
+                    current_item, pending_claim["evidence"], elements
+                )
+                if not verified:
+                    # Transient-evidence fallback: confirmation toasts routinely
+                    # fade during the ~15-20s claim round-trip (LLM + OCR).
+                    # Evidence that WAS visible on the screen the actioner
+                    # claimed from is legitimate — nothing the agent did in
+                    # between could have invalidated it (a claim ends the turn).
+                    # Without this, a rejected save-toast makes the actioner
+                    # click Save again (a redundant write — dangerous in a HIS).
+                    log.info("re-checking claim against the claim-time screen (transient evidence?)")
+                    stale_ok, stale_detail = self._verify_subtask_claim(
+                        current_item, pending_claim["evidence"], claim_time_elements
+                    )
+                    if stale_ok:
+                        verified = True
+                        detail = (stale_detail + " — visible at claim time; since "
+                                  "disappeared (transient confirmation), accepted")
+                actions_log.append({
+                    "iteration": iteration + 1,
+                    "action": "subtask_done",
+                    "claim": pending_claim["claim"],
+                    "evidence": pending_claim["evidence"],
+                    "verified": verified,
+                    "reason": detail,
+                    "thought": pending_claim["thought"],
+                })
+                if verified:
+                    item_txt = current_item.text if current_item else "(no active item)"
+                    boundary = (
+                        f"ITEM COMPLETED (verified): the actioner reports "
+                        f"'{pending_claim['claim']}' on item '{item_txt}'. "
+                        f"Machine evidence check PASSED: {detail}. Give verdict "
+                        "'done' unless you can name a concrete on-screen reason it "
+                        "is not — leaving a machine-verified item open wastes a "
+                        "full round re-proving it."
+                    )
+                    log.info("[RESULT] subtask_done verified — %s", detail)
+                else:
+                    claim_note = detail
+                    log.info("[RESULT] subtask_done REJECTED — evidence check failed")
+                claim_outcome = (
+                    "VERIFIED ✓ — task completed; the supervisor advances the plan"
+                    if verified else "REJECTED — evidence not confirmed on screen"
+                )
+                iteration_actions = [
+                    (fn, a, claim_outcome if fn == "subtask_done" else r)
+                    for fn, a, r in iteration_actions
+                ]
 
             # Record one trail entry per action in this iteration.
             for fn_name, args, result in iteration_actions:
@@ -3080,29 +4146,143 @@ class ComputerAgent:
                 ))
 
             elements_text = self._format_elements(elements)
+            subtask_iters += 1
 
-            # Narrator (expensive VLM) only when the cheap signals are insufficient:
-            # an ambiguous transition (popup/replaced) or an ongoing stuck run. Runs
-            # BEFORE the navigator so the navigator gets 'eyes' on the hard screen.
+            # --- Focus auto-tick (deterministic — no supervisor needed) ------ #
+            if (boundary is None and current_item is not None
+                    and current_item.kind == "focus" and self.executor.focused_once):
+                sup.plan.mark(current_item, "done", "window focused")
+                log.info("[TODO] ✓ %s", current_item.text)
+                log.info("[TODOS] %s", sup.plan.to_marker())
+                boundary = ("FOCUS ACHIEVED: the target application is now in the "
+                            "foreground. Plan the actual work item(s) from this screen.")
+
+            # --- Wrong-field guard (deterministic geometry, every action) ---- #
+            if boundary is None and current_item is not None:
+                alarm = guard_wrong_field(change, current_item, elements)
+                if alarm:
+                    log.warning("wrong-field guard: %s", alarm)
+                    log.info("[INTERVENE] wrong-field alarm")
+                    log.info("[ISSUE] %s", alarm)
+                    boundary = (f"WRONG-FIELD ALARM (detected by geometry, not by the "
+                                f"actioner): {alarm} Insert a corrective item to revert "
+                                "the wrong field before anything else.")
+
+            # --- Budget / stuck boundaries ----------------------------------- #
+            if boundary is None and subtask_iters >= self.cfg.subtask_max_iterations:
+                item_txt = current_item.text if current_item else "(no active item)"
+                boundary = (f"BUDGET EXHAUSTED: {subtask_iters} action rounds spent on "
+                            f"item '{item_txt}' without completion. Revise it, split it, "
+                            "take another route, or fail it.")
+            if (boundary is None and self._no_change_streak >= 4
+                    and self._no_change_streak % 2 == 0):
+                # Every 2nd stuck round, not every round — the supervisor needs a
+                # chance to see whether its last redirect worked before re-firing.
+                boundary = (f"STUCK: the screen has not changed for "
+                            f"{self._no_change_streak} action rounds. Redirect the "
+                            "actioner (different route/keyboard) or change the plan.")
+            if self._no_change_streak >= 7:
+                log.error("Screen unchanged for %d consecutive iterations — aborting.",
+                          self._no_change_streak)
+                log.info("[INTERVENE] stop: screen unchanged for %d consecutive steps",
+                         self._no_change_streak)
+                actions_log.append({"iteration": iteration + 1, "error": "aborted: screen stuck"})
+                break
+
+            # Narrator (expensive VLM) only when a supervisor round is imminent
+            # AND the cheap signals are insufficient (ambiguous transition, stuck
+            # screen, alarm). Its narration is consumed by the supervisor — a
+            # narrator call with no boundary pending is ~20s of latency for a
+            # ride-along note the actioner rarely needs.
             narration = ""
-            if (nav is not None and self.cfg.use_narrator
-                    and (change.transition in ("popup", "replaced") or nav.stuck_rounds >= 2)):
+            if (boundary is not None and self.cfg.use_narrator
+                    and (change.transition in ("popup", "replaced")
+                         or "STUCK" in boundary or "ALARM" in boundary
+                         or "BUDGET" in boundary)):
                 narration = self._narrate(screenshot_b64, change, tokens)
                 if narration:
                     log.info("[NARRATOR] %s", narration)
-                    nav.last_narration = narration  # consumed by the navigator below
+                    sup.last_narration = narration  # consumed by the supervisor below
 
-            # Navigator re-assesses progress toward the goal (text-only, cheap) and
-            # updates the objective/guidance the actioner sees next.
-            if nav is not None:
-                self._navigate(nav, change, trail, elements_text, tokens)
+            # --- Supervisor boundary: verdict, replan, control --------------- #
+            switched_item = False
+            if boundary is not None:
+                subtask_iters = 0
+                outcome = self._boundary_round(
+                    sup, boundary, change, trail, elements, elements_text,
+                    tokens, actions_log, iteration + 1,
+                )
+                if outcome == "ask_user":
+                    pending_question = sup.control_detail or "The supervisor needs input to proceed."
+                    break
+                if outcome == "stop":
+                    break
+                if outcome == "complete":
+                    task_done = True
+                    break
+                # continue → make sure an item is active (replanning if the
+                # supervisor ticked the last one without adding new work).
+                nxt = sup.plan.current() or sup.plan.activate_next()
+                while nxt is None and not run_over:
+                    empty_plan_rounds += 1
+                    if empty_plan_rounds > 3:
+                        log.error("Supervisor produced no actionable items — aborting.")
+                        actions_log.append({"iteration": iteration + 1,
+                                            "error": "aborted: supervisor produced no plan"})
+                        run_over = True
+                        break
+                    if empty_plan_rounds > 1:
+                        sup.fail_note = (
+                            "REJECTED: your previous update added no usable items while "
+                            "control was 'continue'. The actioner is IDLE and nothing will "
+                            "happen until you act. Respond NOW with add_items (at least one "
+                            "concrete item), or set control to task_complete/stop."
+                        )
+                    outcome = self._boundary_round(
+                        sup, "NO PENDING ITEMS — the actioner has nothing to do. You MUST respond "
+                        "with add_items (at least one concrete item), or set control to "
+                        "task_complete/stop. Assessing without adding items is a wasted "
+                        "round and will simply be retried.",
+                        change, trail, elements, elements_text, tokens, actions_log,
+                        iteration + 1,
+                    )
+                    if outcome == "ask_user":
+                        pending_question = sup.control_detail or "The supervisor needs input to proceed."
+                        run_over = True
+                        break
+                    if outcome == "stop":
+                        run_over = True
+                        break
+                    if outcome == "complete":
+                        task_done = True
+                        run_over = True
+                        break
+                    nxt = sup.plan.activate_next()
+                if run_over:
+                    break
+                empty_plan_rounds = 0
+                switched_item = nxt is not current_item
+                if switched_item:
+                    # A different item is a different approach — give it a fresh
+                    # runway on the stuck counter (max_iterations still caps the run).
+                    self._no_change_streak = 0
+                current_item = nxt
+                history.set_task(render_current_task(current_item, sup.guidance))
+                sup.guidance = ""
+                log.info("[NAV] → objective: %s", current_item.text)
+                log.info("[TODOS] %s", sup.plan.to_marker())
 
-            # Build the next observation note: navigator objective first (the
-            # steering signal), then the change-set (what the last action caused),
-            # then any narrator observation, then the full trail and warnings.
+            # Build the next observation note: claim/plan feedback first, then the
+            # change-set (what the last action caused), then any narrator
+            # observation, then the full trail and warnings.
             note_parts: List[str] = []
-            if nav is not None:
-                note_parts.append(nav.render_for_actioner())
+            if switched_item:
+                note_parts.append(
+                    "The supervisor reviewed progress and updated the plan — your "
+                    "CURRENT TASK block above is up to date; work on THAT."
+                )
+            if claim_note:
+                note_parts.append(claim_note)
             note_parts.append(change.render())
             if narration:
                 note_parts.append("VISUAL OBSERVATION (narrator): " + narration)
@@ -3117,12 +4297,6 @@ class ComputerAgent:
                     "⚠ Screen unchanged for multiple iterations — try an entirely "
                     "different approach (different target, keyboard navigation, or wait)."
                 )
-            if self._no_change_streak >= 5:
-                log.error("Screen unchanged for %d consecutive iterations — aborting.",
-                          self._no_change_streak)
-                actions_log.append({"iteration": iteration + 1, "error": "aborted: screen stuck"})
-                break
-
             note = "\n\n".join(p for p in note_parts if p)
             history.add_observation(elements_text, screenshot_b64, note=note)
 
@@ -3141,6 +4315,9 @@ class ComputerAgent:
                 "tasks": prior_tasks + [instruction],
                 "trail": trail.export(),
                 "last_iteration": entries[-1].iteration if entries else iter_base,
+                # Persist the supervisor's plan so a follow-up request (including
+                # a reply to an ask_user question) continues the same todo list.
+                "todos": sup.plan.export(),
                 # Persist the focused app so follow-up requests re-focus it
                 # deterministically. Falls back to the prior value if this run
                 # never (re-)focused. Wiped by clear_session on 'New conversation'.
@@ -3155,116 +4332,6 @@ class ComputerAgent:
             "question": pending_question,  # non-None if the run ended on ask_user
         }
 
-    # --- completion verification ----------------------------------------- #
-
-    def _verify_completion(
-        self,
-        task: str,
-        claim: str,
-        evidence: List[str],
-        history: ConversationHistory,
-        tokens: Dict[str, int],
-        trail: ProgressTrail,
-    ) -> Tuple[bool, str]:
-        """
-        Re-screenshot, re-check evidence against the FRESH OCR (things may
-        have changed in the ~0.6s since the actor's claim), and if it still
-        holds, ask the model with a restricted tool set (finish_task |
-        continue_working). The verifier must itself cite evidence, which is
-        also checked against OCR before acceptance. No auto-execution of
-        corrective actions.
-        """
-        log.info("Verifying completion: %s", claim)
-        time.sleep(0.1)
-        self.executor.tick_click_age()
-        # Evidence is typically a value typed into a still-focused field, so the
-        # caret is likely present — remove it before the OCR evidence re-check.
-        screenshot_b64, elements, change = self._parse_screen(decaret=True)
-
-        # Re-check actor's evidence against the fresh OCR.
-        evidence_ok, ev_details = check_evidence_in_ocr(evidence, elements)
-        log.info("verifier re-check of actor's evidence:")
-        log_evidence_summary(evidence, ev_details)
-        if not evidence_ok:
-            rejection = format_evidence_rejection(ev_details)
-            # Push into history so the actor sees the rejection on its next turn.
-            history.add_observation(
-                self._format_elements(elements), screenshot_b64,
-                note=trail.render() + "\n\n" + rejection if trail.entries() else rejection,
-            )
-            return False, "evidence disappeared on re-check of fresh screen"
-
-        elements_text = self._format_elements(elements)
-        note_parts = [change.render()] if not change.is_empty else []
-        if trail.entries():
-            note_parts.append(trail.render())
-        note_parts.append(
-            f"VERIFICATION REQUEST: the actor claimed the task is done ('{claim}') "
-            f"and cited evidence:\n  - " + "\n  - ".join(f"'{e}'" for e in evidence) +
-            f"\nTask was: '{task}'. Look carefully at the current screen. "
-            "If truly done, call finish_task with YOUR OWN evidence (text you see "
-            "on the current screen). Otherwise call continue_working with a short "
-            "reason."
-        )
-        history.add_observation(elements_text, screenshot_b64, note="\n\n".join(note_parts))
-
-        try:
-            response = self._call_llm(history.messages_for_api(), tools=_VERIFICATION_TOOLS)
-        except Exception as exc:
-            log.warning("Verification call failed: %s. NOT accepting claim.", exc)
-            return False, f"api failure during verification — not accepting: {exc}"
-
-        tokens["calls"] += 1
-        if "usage" in response:
-            u = response["usage"]
-            tokens["input"] += u.get("prompt_tokens", 0)
-            tokens["output"] += u.get("completion_tokens", 0)
-            tokens["total"] += u.get("total_tokens", 0)
-
-        vmsg = response["choices"][0]["message"]
-        history.add_assistant(vmsg)
-        vtcs = vmsg.get("tool_calls") or []
-        decision: Optional[Tuple[bool, str]] = None
-        if vtcs:
-            tc = vtcs[0]
-            fn = tc["function"]["name"]
-            try:
-                args = json.loads(tc["function"]["arguments"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            if fn in ("finish_task", "task_complete"):
-                # Verifier must also ground its answer in visible evidence.
-                v_evidence = args.get("evidence") or []
-                if not isinstance(v_evidence, list):
-                    v_evidence = [str(v_evidence)]
-                v_ok, v_details = check_evidence_in_ocr(v_evidence, elements)
-                log.info("verifier's own evidence check:")
-                log_evidence_summary(v_evidence, v_details)
-                if not v_ok:
-                    history.add_tool_result(tc["id"], format_evidence_rejection(v_details))
-                    decision = (False, "verifier cited evidence not findable in OCR")
-                else:
-                    history.add_tool_result(tc["id"], "verified complete")
-                    decision = (True, "model confirmed after seeing current screen")
-            elif fn == "continue_working":
-                reason = args.get("reason", "no reason given")
-                history.add_tool_result(tc["id"], f"noted: {reason}")
-                decision = (False, f"model rejected claim: {reason}")
-            else:
-                # Unknown tool — close the id with a placeholder.
-                history.add_tool_result(tc["id"], f"ignored: unknown tool '{fn}' during verification")
-                decision = (False, f"verifier called unknown tool: {fn}")
-
-        if decision is None:
-            # Model emitted text or no tool calls at all.
-            text = (vmsg.get("content") or "").strip()[:200]
-            decision = (False, f"verifier did not call a recognized tool (said: {text!r})")
-
-        # Safety net: ensure every verifier tool_call has a matching tool response.
-        history.ensure_tool_results_for(vtcs, placeholder="(verifier response ignored)")
-        return decision
-
-
 # --- Entry point ----------------------------------------------------------- #
 
 def _load_config() -> AgentConfig:
@@ -3277,13 +4344,45 @@ def _load_config() -> AgentConfig:
             f"Missing configuration. Set {profile}_ENDPOINT and {profile}_MODEL "
             "(or LLM_ENDPOINT / LLM_MODEL) in your .env file."
         )
+    # The actioner (and the narrator, which reuses its model) consume
+    # screenshots every step — a text-only profile cannot drive them.
+    if (os.getenv(f"{profile}_VISION") or "1").strip().lower() in ("0", "false", "no", "off"):
+        log.warning(
+            "ACTIVE_PROFILE %s is marked text-only (%s_VISION=0), but the actioner "
+            "and narrator need a VISION model — screenshots will be sent anyway and "
+            "the run will likely fail. Pick a vision profile as actioner.",
+            profile, profile,
+        )
     use_navigator = os.getenv("NAVIGATOR", "1").strip().lower() not in ("0", "false", "no", "off")
     use_narrator = os.getenv("NARRATOR", "1").strip().lower() not in ("0", "false", "no", "off")
     continue_session = os.getenv("CONTINUE_SESSION", "1").strip().lower() not in ("0", "false", "no", "off")
+    # Optional stronger supervisor model. NAVIGATOR_PROFILE is primary (a profile
+    # name whose *_MODEL is used; 'SAME'/empty → reuse the actioner model). Falls
+    # back to NAVIGATOR_MODEL (direct id) only when no profile is set. Shared proxy.
+    nav_profile = (os.getenv("NAVIGATOR_PROFILE") or "").strip()
+    navigator_model = None
+    if nav_profile and nav_profile.upper() not in ("SAME", "ACTIONER", "NONE"):
+        navigator_model = os.getenv(f"{nav_profile.upper()}_MODEL")
+    elif not nav_profile:
+        navigator_model = os.getenv("NAVIGATOR_MODEL")
+    if navigator_model:
+        log.info("Supervisor uses a separate model: %s", navigator_model)
+    try:
+        subtask_budget = max(2, int(os.getenv("SUBTASK_MAX_ITER", "8")))
+    except ValueError:
+        subtask_budget = 8
+    # Per-request timeout (seconds). Raise via .env when the supervisor runs on
+    # a large, possibly overloaded model whose responses can take minutes.
+    try:
+        request_timeout = max(10, int(os.getenv("REQUEST_TIMEOUT", "120")))
+    except ValueError:
+        request_timeout = 120
     return AgentConfig(
         endpoint=endpoint, api_key=api_key, model=model,
         use_navigator=use_navigator, use_narrator=use_narrator,
-        continue_session=continue_session,
+        continue_session=continue_session, navigator_model=navigator_model,
+        subtask_max_iterations=subtask_budget,
+        request_timeout=request_timeout,
     )
 
 

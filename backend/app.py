@@ -13,10 +13,18 @@ import time
 import multiprocessing
 import signal
 from email.utils import formatdate
+from concurrent.futures import ThreadPoolExecutor
+import requests
+import urllib3
+from dotenv import load_dotenv, dotenv_values
 
 # Add parent directory to path to import agent
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
+
+_ENV_PATH = os.path.join(parent_dir, '.env')
+load_dotenv(_ENV_PATH)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 CORS(app)
@@ -29,6 +37,103 @@ log_queue = queue.Queue()
 agent_process = None
 # Lock to prevent race conditions on agent_process
 _agent_lock = threading.Lock()
+# Model profiles selected in the UI (override the .env defaults for the next task).
+# _selected_nav_profile == "SAME" means the supervisor reuses the actioner's model.
+_selected_profile = None
+_selected_nav_profile = None
+
+
+# --- Model profiles (from .env) ------------------------------------------- #
+
+def _env_config():
+    """Merged view of .env + process env (process env wins)."""
+    cfg = dict(dotenv_values(_ENV_PATH))
+    cfg.update(os.environ)
+    return cfg
+
+
+def _list_profiles(cfg=None):
+    """Every profile with both a *_MODEL and a *_ENDPOINT in the config.
+
+    Each profile carries a 'vision' capability flag (from <PROFILE>_VISION,
+    default true). Text-only profiles (VISION=0) may serve as the SUPERVISOR
+    but never as the actioner — the actioner and narrator consume screenshots."""
+    cfg = cfg or _env_config()
+    profiles = []
+    for key, val in cfg.items():
+        if key.endswith('_MODEL') and val:
+            prof = key[:-len('_MODEL')]
+            endpoint = cfg.get(f'{prof}_ENDPOINT')
+            if prof and endpoint:
+                vision_flag = str(cfg.get(f'{prof}_VISION', '1')).strip().lower()
+                profiles.append({
+                    'profile': prof,
+                    'model': val,
+                    'endpoint': endpoint,
+                    'vision': vision_flag not in ('0', 'false', 'no', 'off'),
+                })
+    profiles.sort(key=lambda p: p['profile'])
+    return profiles
+
+
+def _active_profile(cfg=None):
+    cfg = cfg or _env_config()
+    return (_selected_profile or cfg.get('ACTIVE_PROFILE') or '').upper()
+
+
+def _active_nav_profile(cfg=None):
+    """Supervisor profile: UI selection, else NAVIGATOR_PROFILE from .env, else map
+    a direct NAVIGATOR_MODEL to a profile, else 'SAME' (reuse the actioner model)."""
+    cfg = cfg or _env_config()
+    if _selected_nav_profile is not None:
+        return _selected_nav_profile.upper()
+    val = (cfg.get('NAVIGATOR_PROFILE') or '').upper()
+    if val and val not in ('SAME', 'ACTIONER', 'NONE'):
+        return val
+    nm = cfg.get('NAVIGATOR_MODEL')
+    if nm:
+        for p in _list_profiles(cfg):
+            if p['model'] == nm:
+                return p['profile'].upper()
+    return 'SAME'
+
+
+def _endpoint_base(endpoint):
+    """Strip a trailing /chat/completions so we can query the sibling /models."""
+    return (endpoint or '').rsplit('/chat/completions', 1)[0].rstrip('/')
+
+
+def _live_models_for_base(base, api_key):
+    """Set of model ids the server at *base* is actually serving (via GET /models),
+    or an empty set if the endpoint is unreachable."""
+    if not base:
+        return set()
+    try:
+        headers = {'Authorization': f'Bearer {api_key}'} if api_key else {}
+        resp = requests.get(base + '/models', headers=headers, timeout=6, verify=False)
+        resp.raise_for_status()
+        return {m.get('id') for m in resp.json().get('data', [])}
+    except Exception:
+        return set()
+
+
+def _availability(profiles, cfg):
+    """Map each profile -> bool: is its model id actually being served? Groups by
+    endpoint base so each proxy's /models is fetched once (concurrently)."""
+    bases = {}  # base -> api_key (first profile that uses it)
+    for p in profiles:
+        base = _endpoint_base(p['endpoint'])
+        if base and base not in bases:
+            bases[base] = cfg.get(f"{p['profile']}_API_KEY", '')
+    live_by_base = {}
+    if bases:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for base, live in ex.map(lambda b: (b, _live_models_for_base(b, bases[b])), list(bases)):
+                live_by_base[base] = live
+    return {
+        p['profile']: p['model'] in live_by_base.get(_endpoint_base(p['endpoint']), set())
+        for p in profiles
+    }
 
 
 def _temp_dir():
@@ -140,6 +245,14 @@ def start_task():
         global agent_process
         if agent_process is not None and agent_process.is_alive():
             return jsonify({'error': 'Agent already running'}), 409
+
+        # Apply the UI-selected model profiles so the spawned agent picks them up
+        # (the child inherits os.environ; load_dotenv won't override existing keys).
+        if _selected_profile:
+            os.environ['ACTIVE_PROFILE'] = _selected_profile
+        if _selected_nav_profile is not None:
+            # 'SAME' → supervisor reuses the actioner model (agent maps it to no override).
+            os.environ['NAVIGATOR_PROFILE'] = _selected_nav_profile
 
         # Use multiprocessing.Queue for inter-process log streaming
         mp_log_queue = multiprocessing.Queue()
@@ -265,12 +378,63 @@ def health():
 
 @app.route('/api/info')
 def info():
-    """Return backend model info"""
-    profile = os.getenv('ACTIVE_PROFILE', 'gemma').upper()
+    """Return backend model info for the active profile."""
+    cfg = _env_config()
+    profile = _active_profile(cfg) or 'GEMMA'
     return jsonify({
-        'model': os.getenv(f'{profile}_MODEL', 'unknown'),
-        'endpoint': os.getenv(f'{profile}_ENDPOINT', 'unknown')
+        'model': cfg.get(f'{profile}_MODEL', 'unknown'),
+        'endpoint': cfg.get(f'{profile}_ENDPOINT', 'unknown'),
+        'profile': profile,
     })
+
+
+@app.route('/api/models')
+def list_models():
+    """List all model profiles from .env, mark the active one, and probe which
+    endpoints are currently reachable so the UI can grey out offline ones."""
+    cfg = _env_config()
+    profiles = _list_profiles(cfg)
+    avail = _availability(profiles, cfg)  # model id must be served, not just host reachable
+    models = [
+        {'profile': p['profile'], 'model': p['model'],
+         'available': avail.get(p['profile'], False), 'vision': p['vision']}
+        for p in profiles
+    ]
+    return jsonify({
+        'models': models,
+        'active': _active_profile(cfg),          # actioner
+        'nav_active': _active_nav_profile(cfg),  # supervisor ('SAME' = reuse actioner)
+    })
+
+
+@app.route('/api/select_model', methods=['POST'])
+def select_model():
+    """Select the profile used for the NEXT task. role='actioner' (default) sets the
+    actioner model; role='navigator' sets the supervisor model ('SAME' = reuse actioner)."""
+    global _selected_profile, _selected_nav_profile
+    data = request.json or {}
+    role = (data.get('role') or 'actioner').strip().lower()
+    prof = (data.get('profile') or '').strip().upper()
+    profiles = _list_profiles()
+    known = {p['profile'].upper() for p in profiles}
+    vision_by_prof = {p['profile'].upper(): p['vision'] for p in profiles}
+    if role == 'navigator':
+        # Supervisor is text-only reasoning — any profile qualifies.
+        if prof != 'SAME' and prof not in known:
+            return jsonify({'error': f'unknown profile: {prof}'}), 400
+        _selected_nav_profile = prof or 'SAME'
+        print(f"[API] Supervisor profile selected: {_selected_nav_profile}")
+        return jsonify({'status': 'ok', 'nav_active': _selected_nav_profile})
+    if prof not in known:
+        return jsonify({'error': f'unknown profile: {prof}'}), 400
+    if not vision_by_prof.get(prof, True):
+        # The actioner (and the narrator, which reuses its model) consume
+        # screenshots — a text-only profile cannot drive them.
+        return jsonify({'error': f'profile {prof} is text-only (VISION=0) — '
+                                 'it can only be used as the supervisor'}), 400
+    _selected_profile = prof
+    print(f"[API] Actioner profile selected: {prof}")
+    return jsonify({'status': 'ok', 'active': prof})
 
 
 if __name__ == '__main__':
