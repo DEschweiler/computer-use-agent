@@ -60,6 +60,7 @@ import datetime
 import difflib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -610,6 +611,12 @@ or two fields, save a form). Split anything bigger.
 - Each item must be self-contained: put every fact the actioner needs (names, \
 values to type, which record/patient) into the item text or its context field — \
 the actioner cannot see the user request or the other items.
+- Describe WHAT to achieve, never raw pixel coordinates or element ids — those \
+go stale between screens; the actioner grounds targets on the live screen itself.
+- Name controls by their FUNCTION ("the save/submit button at the bottom of the \
+form") unless the exact label is VISIBLE in the screen elements — an invented \
+label (e.g. 'Save Profile' when the button says 'Add') sends the actioner \
+hunting for something that does not exist.
 - ONLY for items that ENTER or CHANGE data: set expected_value (the exact text \
 that should appear) and expected_label (the field label EXACTLY as written on \
 screen, e.g. 'Last Name *' — never a description like 'button' or an invented \
@@ -628,14 +635,17 @@ already run; its result is shown to you — trust it over the actioner's claim).
 'not_done' keeps the item active for another round; 'failed' abandons it (then \
 add a replacement item that takes a different route).
 - add_items — ONLY genuinely NEW work. The todo list shown to you is the \
-COMPLETE plan: pending (○) items are already queued — do NOT re-add them; \
-duplicates of open items are dropped automatically. Items that FIX A MISTAKE \
-(value typed into the wrong field, wrong record opened, stray dialog, corrupted \
-data) get corrective=true and jump to the FRONT of the queue: mistakes are \
-fixed before any new work.
+COMPLETE plan: pending (○) items are already queued — do NOT re-add them. \
+Only verbatim-identical duplicates are dropped automatically; spotting REWORDED \
+redundancy is YOUR responsibility (consolidate via obsolete_item_ids). Items \
+that FIX A MISTAKE (value typed into the wrong field, wrong record opened, \
+stray dialog, corrupted data) get corrective=true and jump to the FRONT of the \
+queue: mistakes are fixed before any new work.
 - obsolete_item_ids — close OPEN items that should not be worked: duplicates, \
 superseded plans, or work already covered by completed items. Working a stale \
-item re-executes actions against already-saved data — close it instead.
+item re-executes actions against already-saved data — close it instead. To \
+REPLACE an item with a better formulation, list its id here AND add the new \
+item in the same call.
 - control:
     'continue'      — keep working (the normal case).
     'ask_user'      — something only the user can resolve (missing information, \
@@ -944,6 +954,9 @@ class ChangeSet:
     # signal that a click landed in an edit field — clicking into a field often
     # causes no other visible change).
     caret_xy: Optional[Tuple[int, int]] = None
+    # Geometric resolution of WHICH field the caret sits in, e.g.
+    # "inside [e81] 'John', next to label 'First Name *'" (may be empty).
+    caret_context: str = ""
 
     @property
     def is_empty(self) -> bool:
@@ -953,12 +966,14 @@ class ChangeSet:
         """Human/LLM-readable 'SINCE YOUR LAST ACTION' block. Empty string if nothing changed."""
         base = self._render_base()
         if self.caret_xy:
+            where = f" ({self.caret_context})" if self.caret_context else ""
             base += (
                 f"\nFOCUS INDICATOR: a text caret is blinking at "
-                f"({self.caret_xy[0]},{self.caret_xy[1]}) — the edit field there IS "
+                f"({self.caret_xy[0]},{self.caret_xy[1]}){where} — THAT field is "
                 "focused. (The caret is removed from the screenshot; a click into a "
-                "field often causes no other visible change. Do NOT re-click — type "
-                "or select text now.)"
+                "field often causes no other visible change. If this is the field "
+                "you intended, do NOT re-click — type or select text now. If it is "
+                "a DIFFERENT field, your click landed wrong.)"
             )
         return base
 
@@ -1001,7 +1016,8 @@ class ChangeSet:
         """Compact single-line summary — safe for the (newline-delimited) log/SSE stream."""
         s = self._summary_base()
         if self.caret_xy:
-            s += f"; caret blinking at ({self.caret_xy[0]},{self.caret_xy[1]}) — field focused"
+            where = f" {self.caret_context}" if self.caret_context else ""
+            s += f"; caret blinking at ({self.caret_xy[0]},{self.caret_xy[1]}){where} — field focused"
         return s
 
     def _summary_base(self) -> str:
@@ -1747,6 +1763,55 @@ def annotate_screenshot(
 
 # --- Action executor ------------------------------------------------------- #
 
+# Cursor glide. Teleporting the pointer to the target makes a run hard to follow
+# on screen, so clicks/scrolls ease the cursor over instead.
+#
+# The knob is a *speed percentage*: 0 = slowest, 100 = instant (the pre-glide
+# jump). It maps to the time for a full screen-diagonal traverse, scaled down
+# pro rata for shorter hops — so one setting feels consistent whether the target
+# is 100px away or on the far monitor. Don't run it too slow: the pointer only
+# *passes* over whatever lies on the line to the target, and a slow traverse
+# gives hover-triggered menus and tooltips time to open and swallow the click.
+_MOUSE_GLIDE = os.getenv("MOUSE_GLIDE", "1").strip().lower() not in ("0", "false", "no", "off")
+_MOUSE_GLIDE_SPEED_PCT = float(os.getenv("MOUSE_GLIDE_SPEED_PCT", "30"))  # 1 = slowest .. 100 = near-instant
+_MOUSE_GLIDE_MIN_PCT = 1.0                                             # 0% would read as "stopped", which it never is
+_MOUSE_GLIDE_SLOWEST_S = 2.2                                           # full-diagonal traverse at 1%
+_MOUSE_GLIDE_FASTEST_S = 0.05                                          # full-diagonal traverse at 100%
+_MOUSE_GLIDE_MIN_S = 0.04                                              # below this an animation is imperceptible — just jump
+_MOUSE_GLIDE_MIN_PX = 8                                                # ignore micro-moves
+_MOUSE_GLIDE_STEP_S = 0.008                                            # ~120 fps target
+_MOUSE_GLIDE_MAX_STEPS = 300
+
+
+def _glide_speed_pct() -> float:
+    """Cursor speed 1-100, re-read from disk on every glide.
+
+    The backend spawns a fresh agent process per task, so an env var alone would
+    only take effect on the *next* task. The UI slider writes this file instead,
+    which lets a speed change apply mid-run. Missing/unreadable file → env value.
+    """
+    try:
+        raw = (_temp_dir() / "agent_cursor_speed.txt").read_text(encoding="utf-8").strip()
+        return max(_MOUSE_GLIDE_MIN_PCT, min(100.0, float(raw)))
+    except Exception:
+        return max(_MOUSE_GLIDE_MIN_PCT, min(100.0, _MOUSE_GLIDE_SPEED_PCT))
+
+
+def _glide_full_s(pct: float) -> float:
+    """Seconds for a full screen-diagonal traverse at cursor speed `pct`.
+
+    Geometric, not linear: every slider step changes the speed by the same
+    *factor* (~1.4x per 10 points), so the control has usable resolution across
+    its whole travel. Linear interpolation over a 44x range — either in duration
+    or in speed — leaves one half of the slider doing almost nothing.
+
+    The scale is therefore lopsided towards slow, and the 30% default lands at
+    ~0.73s per diagonal rather than the midpoint.
+    """
+    span = 100.0 - _MOUSE_GLIDE_MIN_PCT
+    u = (max(_MOUSE_GLIDE_MIN_PCT, min(100.0, pct)) - _MOUSE_GLIDE_MIN_PCT) / span
+    return _MOUSE_GLIDE_SLOWEST_S * (_MOUSE_GLIDE_FASTEST_S / _MOUSE_GLIDE_SLOWEST_S) ** u
+
 _KEY_MAP = {
     "strg": "ctrl", "control": "ctrl",
     "meta": "win", "super": "win", "command": "win", "cmd": "win",
@@ -1808,6 +1873,39 @@ class ActionExecutor:
         y = max(2, min(self.height - 2, int(y)))
         return x, y
 
+    def _glide(self, x: int, y: int) -> None:
+        """Ease the cursor to (x, y) instead of letting it teleport there.
+
+        Cosmetic only — the caller still issues its click at the same absolute
+        coordinates, so a glide that is skipped or fails changes nothing about
+        where the click lands. Hence the blanket except: a movement problem must
+        never cost us the action itself.
+        """
+        if not _MOUSE_GLIDE:
+            return
+        try:
+            cx, cy = pyautogui.position()
+            dist = math.hypot(x - cx, y - cy)
+            if dist < _MOUSE_GLIDE_MIN_PX:
+                return
+            diag = math.hypot(self.width, self.height) or 1.0
+            duration = _glide_full_s(_glide_speed_pct()) * min(1.0, dist / diag)
+            if duration < _MOUSE_GLIDE_MIN_S:
+                return  # a glide this brief looks identical to the jump
+            # Stepped by hand rather than via moveTo(duration=...): pyautogui
+            # sleeps MINIMUM_SLEEP (0.05s) per step, which yields ~7 frames over
+            # a full-screen move — still visibly a series of jumps.
+            steps = max(2, min(_MOUSE_GLIDE_MAX_STEPS, int(duration / _MOUSE_GLIDE_STEP_S)))
+            for i in range(1, steps + 1):
+                t = i / steps
+                e = 1.0 - (1.0 - t) * (1.0 - t)  # ease-out quad
+                pyautogui.moveTo(int(cx + (x - cx) * e), int(cy + (y - cy) * e))
+                if i < steps:
+                    time.sleep(duration / steps)
+            pyautogui.moveTo(x, y)  # land exactly, whatever the rounding did
+        except Exception:
+            log.debug("glide failed, falling back to instant move", exc_info=True)
+
     def execute(self, action_type: str, args: Dict[str, Any]) -> str:
         try:
             # Gate: never touch the screen until a target application has been
@@ -1833,6 +1931,7 @@ class ActionExecutor:
                     return err
                 x, y = self._clamp(*point)
                 button = args.get("button", "left")
+                self._glide(x, y)
                 if action_type == "double_click":
                     pyautogui.doubleClick(x, y)
                 else:
@@ -1848,6 +1947,7 @@ class ActionExecutor:
                     return err
                 x, y = self._clamp(*point)
                 text = args.get("text", "")
+                self._glide(x, y)
                 pyautogui.click(x, y)
                 self.last_click_point = (x, y)
                 self.last_click_age = 0
@@ -1880,7 +1980,9 @@ class ActionExecutor:
                 x = args.get("x", self.width // 2)
                 y = args.get("y", self.height // 2)
                 scroll_clicks = int(args.get("scroll_clicks", args.get("scroll_y", 0)))
-                pyautogui.moveTo(*self._clamp(x, y))
+                sx, sy = self._clamp(x, y)
+                self._glide(sx, sy)
+                pyautogui.moveTo(sx, sy)
                 pyautogui.scroll(scroll_clicks)  # pyautogui: positive=up, negative=down
                 return f"scrolled {scroll_clicks} clicks ({'up' if scroll_clicks > 0 else 'down'})"
 
@@ -2406,6 +2508,35 @@ def check_value_near_label(
     return "fail", f"value '{value}' is on screen but NOT next to '{label}'{where}"
 
 
+def describe_caret_position(
+    caret_xy: Tuple[int, int], elements: List[Element]
+) -> str:
+    """Resolve WHICH field a blinking caret sits in — pure geometry, no LLM.
+
+    Returns e.g. "inside [e81] 'John', next to label 'First Name *'" (either
+    part may be absent), or "" when nothing can be resolved. Saves the actioner
+    from inferring the focused field from a bare coordinate — and exposes
+    focus landing in the WRONG field immediately."""
+    x, y = caret_xy
+    containing = [el for el in elements
+                  if el.x <= x <= el.x + el.width and el.y <= y <= el.y + el.height]
+    best = min(containing, key=lambda el: el.width * el.height) if containing else None
+    # Synthetic caret-shaped element so the label-adjacency geometry applies.
+    caret_el = Element(
+        stable_id="", text="", control_type="Caret", source="ocr",
+        x=x - 1, y=y - 8, width=2, height=16, center_x=x, center_y=y,
+    )
+    label = _nearest_label(caret_el, elements)
+    parts: List[str] = []
+    if best is not None:
+        text = best.text.replace("\n", " ").strip()
+        desc = f"[{best.stable_id}]" + (f" '{text[:40]}'" if text else " <interactive>")
+        parts.append(f"inside {desc}")
+    if label is not None and label is not best:
+        parts.append(f"next to label '{label.text.strip()[:40]}'")
+    return ", ".join(parts)
+
+
 def guard_wrong_field(
     change: "ChangeSet", todo: "TodoItem", elements: List[Element]
 ) -> Optional[str]:
@@ -2715,9 +2846,15 @@ RULES:
   click with raw x/y.
 - Clicking INTO an edit field usually causes NO visible change — the blinking \
   caret is removed from screenshots. Watch for the FOCUS INDICATOR line ("a text \
-  caret is blinking at (x,y)") in the observation: it means your click DID focus \
-  the field at that position. Proceed with Ctrl+A / typing — do NOT click again \
-  or switch to another element. Judge the edit by the text change afterwards.
+  caret is blinking at (x,y) (inside [id] ..., next to label ...)") in the \
+  observation: it tells you WHICH field your click focused. If it is the field \
+  you intended, do NOT click again — type or select text now. If it names a \
+  DIFFERENT field, your click landed wrong — fix the target, don't type.
+- Dropdown/select fields: if clicking shows a caret but NO option list, the \
+  control is a COMBOBOX — type the option text directly into it (comboboxes \
+  filter as you type), then press Enter or pick the filtered option. Arrow \
+  keys only navigate a list that is actually OPEN; pressing them into a closed \
+  control does nothing.
 - If a warning/error dialog appears, READ its message in the OCR elements \
   BEFORE dismissing it — it usually names the cause. If that cause is outside \
   your CURRENT TASK (e.g. "required fields missing" while your task is only to \
@@ -2870,30 +3007,26 @@ class Plan:
     def get_by_id(self, item_id: int) -> Optional[TodoItem]:
         return next((it for it in self._items if it.id == item_id), None)
 
-    def find_open_duplicate(self, text: str, expected_value: str = "",
-                            expected_label: str = "") -> Optional[TodoItem]:
-        """An OPEN (pending/in_progress) item duplicating the given one.
+    def find_open_duplicate(self, text: str) -> Optional[TodoItem]:
+        """An OPEN (pending/in_progress) item with VERBATIM-identical text
+        (normalized for case/whitespace only).
 
-        PRECISE matches only: identical normalized text, or an identical
-        non-empty expected value+label pair. Deliberately NO fuzzy text
-        matching — form items are templated ("Fill in the X field with 'Y'"),
-        so near-identical wording with a different field/value is NORMAL, and
-        a fuzzy threshold once classified "Fill in the Last Name field with
-        'Doe'" as a duplicate of the First Name item, silently deleting a
-        required step from the plan. The failure asymmetry rules: a duplicate
-        slipping through costs one redundant verify cycle (and can be swept
-        via obsolete_item_ids); a false drop invisibly removes required work."""
+        This is deliberately the ONLY automatic dedup rule left. Two smarter
+        rules were tried and both silently deleted required plan steps:
+        fuzzy text similarity (templated form items differ by one word), and
+        expected-value/label matching (it collided with the supervisor's
+        legitimate replace pattern: obsolete the old item + add a reworded
+        one). Judging semantic redundancy is the SUPERVISOR's job — it sees
+        the whole list and has obsolete_item_ids to consolidate. Machine
+        policy handles only the unambiguous case: the exact same string
+        queued twice does the exact same work."""
         norm = " ".join((text or "").lower().split())
-        ev = (expected_value or "").strip().lower()
-        el = (expected_label or "").strip().lower()
+        if not norm:
+            return None
         for it in self._items:
             if it.status not in ("pending", "in_progress"):
                 continue
-            if norm and norm == " ".join(it.text.lower().split()):
-                return it
-            if (ev and el
-                    and ev == it.expected_value.strip().lower()
-                    and el == it.expected_label.strip().lower()):
+            if norm == " ".join(it.text.lower().split()):
                 return it
         return None
 
@@ -3123,6 +3256,8 @@ class ComputerAgent:
                 if caret_centers:
                     change.caret_xy = (caret_centers[0][0] + win_x,
                                        caret_centers[0][1] + win_y)
+                    change.caret_context = describe_caret_position(
+                        change.caret_xy, self._last_elements)
                 annotated = annotate_screenshot(
                     screenshot, self._last_elements, win_x, win_y,
                     click_marker=self.executor.last_click_point,
@@ -3183,8 +3318,10 @@ class ComputerAgent:
         self._last_elements = reconciled     # cache for the unchanged-screen fast path
         self._last_rect = rect
         if caret_centers:
-            # Surface the (healed-away) caret as a focus indicator, screen-absolute.
+            # Surface the (healed-away) caret as a focus indicator, screen-absolute,
+            # resolved to the field it sits in.
             change.caret_xy = (caret_centers[0][0] + win_x, caret_centers[0][1] + win_y)
+            change.caret_context = describe_caret_position(change.caret_xy, reconciled)
 
         # Pixel-diff highlight: mark what changed since the previous frame — but
         # skip on scroll/replaced, where "everything" changed and a wash is noise.
@@ -3320,17 +3457,30 @@ class ComputerAgent:
         }
         last_exc: Optional[Exception] = None
         for attempt in range(1 + self.cfg.request_retries):
+            t0 = time.monotonic()
             try:
                 resp = requests.post(
                     self.cfg.endpoint, headers=headers, json=payload,
                     verify=self.cfg.verify_tls, timeout=self.cfg.request_timeout,
                 )
                 resp.raise_for_status()
+                elapsed = time.monotonic() - t0
+                if elapsed > 30:
+                    # Slow generations (reasoning models, contended GPU) look
+                    # like hangs from the outside — record what they cost.
+                    log.info("LLM call took %.0fs (model=%s)",
+                             elapsed, payload.get("model"))
                 return resp.json()
             except Exception as exc:
                 last_exc = exc
                 wait = 2 ** attempt
-                log.warning("API call failed (%s). Retry in %ds.", exc, wait)
+                # [RETRY] is timeline-visible: a timed-out long generation that
+                # restarts from scratch is the #1 cause of silent multi-minute
+                # stalls, and it should never look like a hang to the user.
+                log.info("[RETRY] LLM call failed after %.0fs (%s) — attempt %d/%d, retrying in %ds",
+                         time.monotonic() - t0,
+                         " ".join(str(exc).split())[:160],
+                         attempt + 1, 1 + self.cfg.request_retries, wait)
                 time.sleep(wait)
         raise RuntimeError(f"LLM call failed after {self.cfg.request_retries + 1} attempts: {last_exc}")
 
@@ -3427,8 +3577,20 @@ class ComputerAgent:
             log.info("supervisor update_plan recovered from text content")
 
         sup.last_assessment = (args.get("assessment") or "").strip()
-        verdict = (args.get("current_item_verdict") or "no_current_item").strip().lower()
+        verdict = (args.get("current_item_verdict") or "").strip().lower()
         verdict_reason = (args.get("verdict_reason") or "").strip()
+        if not verdict:
+            # Missing field ≠ disagreement (common when the update was recovered
+            # from leaked text content). On a machine-verified completion
+            # boundary, defaulting to 'done' saves a full re-claim cycle; an
+            # EXPLICIT not_done/failed still overrides the machine any time.
+            if boundary.startswith("ITEM COMPLETED (verified)") and sup.plan.current() is not None:
+                verdict = "done"
+                verdict_reason = verdict_reason or "verdict omitted — machine-verified boundary, defaulted to done"
+                log.info("supervisor omitted current_item_verdict on a machine-verified "
+                         "completion — defaulting to 'done'")
+            else:
+                verdict = "no_current_item"
 
         # Verdict on the current item — with a label-anchored override: a 'done'
         # tick on an item with a machine-checkable expected outcome must pass
@@ -3454,9 +3616,26 @@ class ComputerAgent:
                 if verdict_reason:
                     cur.notes = verdict_reason
 
+        # Close obsolete items FIRST (duplicate, superseded, or already
+        # satisfied by completed work) — this must precede add_items so the
+        # supervisor's REPLACE pattern works: "obsolete old item + add reworded
+        # replacement" in one call. With the reverse order, the replacement was
+        # once deduped against the still-open old item and then the old item
+        # was obsoleted — silently deleting the step from the plan.
+        for oid in (args.get("obsolete_item_ids") or []):
+            try:
+                oid = int(oid)
+            except (TypeError, ValueError):
+                continue
+            item = sup.plan.get_by_id(oid)
+            if item is not None and item.status in ("pending", "in_progress"):
+                sup.plan.mark(item, "skipped", "obsolete — closed by supervisor")
+                log.info("[TODO] − %s (obsolete)", item.text)
+
         # New items (corrective ones are scheduled before all normal work).
-        # DEDUP: some models re-emit their whole remaining frontier every round;
-        # an item duplicating an OPEN one is dropped, never queued twice.
+        # Only VERBATIM duplicates of open items are dropped automatically —
+        # judging semantic redundancy is the supervisor's job (see
+        # find_open_duplicate for the history behind this restraint).
         corrective_added = False
         for entry in (args.get("add_items") or []):
             if not isinstance(entry, dict):
@@ -3464,11 +3643,9 @@ class ComputerAgent:
             text = (entry.get("text") or "").strip()
             if not text:
                 continue
-            dup = sup.plan.find_open_duplicate(
-                text, entry.get("expected_value") or "", entry.get("expected_label") or ""
-            )
+            dup = sup.plan.find_open_duplicate(text)
             if dup is not None:
-                log.info("[TODO] ≈ dropped duplicate of open item [%d]: %s", dup.id, text)
+                log.info("[TODO] ≈ dropped verbatim duplicate of open item [%d]: %s", dup.id, text)
                 continue
             item = sup.plan.add(
                 text,
@@ -3479,21 +3656,6 @@ class ComputerAgent:
             )
             corrective_added = corrective_added or item.corrective
             log.info("[TODO] + %s%s", "⚠ " if item.corrective else "", item.text)
-
-        # Close items the supervisor declares obsolete (duplicate, superseded,
-        # or already satisfied by completed work). This is the ONLY way to clear
-        # leftovers other than working them — without it, one stale item forces
-        # a full (and possibly DANGEROUS) redundant work cycle, because the
-        # completion gate rightly refuses to finish while items are open.
-        for oid in (args.get("obsolete_item_ids") or []):
-            try:
-                oid = int(oid)
-            except (TypeError, ValueError):
-                continue
-            item = sup.plan.get_by_id(oid)
-            if item is not None and item.status in ("pending", "in_progress"):
-                sup.plan.mark(item, "skipped", "obsolete — closed by supervisor")
-                log.info("[TODO] − %s (obsolete)", item.text)
 
         # Corrective work PREEMPTS: suspend the active normal item so
         # activate_next() picks the corrective item first; the suspended item
@@ -3545,7 +3707,9 @@ class ComputerAgent:
         Returns 'continue' | 'ask_user' | 'stop' | 'complete'."""
         # Surface the round in the activity timeline BEFORE the (potentially
         # slow) LLM call, so a long supervisor think never looks like a hang.
-        log.info("[SUPERVISE] %s", " ".join(boundary.split())[:220])
+        # Whitespace is collapsed (the SSE stream is newline-delimited) but the
+        # text is NOT truncated — the boundary reason is the round's evidence.
+        log.info("[SUPERVISE] %s", " ".join(boundary.split()))
         if not self._supervise(sup, boundary, change, trail, elements, elements_text, tokens):
             log.info("[INTERVENE] supervisor round failed — continuing with the current plan")
             return "continue"  # keep working the current plan
@@ -3696,11 +3860,13 @@ class ComputerAgent:
             {"role": "user", "content": user_content},
         ]
         try:
-            # 1-3 sentences of observation — 300 tokens is plenty; don't inherit
-            # the supervisor's larger planning budget.
+            # The narrator writes 1-3 sentences, but it runs on the ACTIONER's
+            # model — if that is a reasoning model, hidden thinking counts
+            # against this budget too, so a hard 300-token cap would truncate
+            # it to empty. Scale with the configured budget, bounded at 2048.
             resp = self._call_llm(
                 messages, tools=NARRATOR_TOOLS,
-                max_tokens=min(300, self.cfg.navigator_max_tokens),
+                max_tokens=min(2048, max(300, self.cfg.max_tokens)),
             )
         except Exception as exc:
             log.warning("Narrator call failed (%s).", exc)
@@ -3767,13 +3933,37 @@ class ComputerAgent:
             res = self.executor._focus_window(target_window)
             log.info("[FOCUS] startup re-focus of %r → %s", target_window, res)
 
-        # First frame (no change-set). Decaret is ON: on a continued conversation
-        # a field may still be focused from the previous request, and on a fresh
-        # one the user just typed into the chat input — either way a blinking
-        # caret can corrupt the very OCR the supervisor plans from (a caret
-        # after 'Doe-Doe' once read as 'Doe-Doel' and spawned a phantom
-        # corrective item).
-        screenshot_b64, elements, change = self._parse_screen(decaret=True)
+        # First frame. Only worth full OCR/YOLO when a target application is
+        # already focused (continued conversation with successful re-focus) —
+        # the supervisor then plans from this screen, and decaret matters
+        # because a field may still hold a blinking caret from the previous
+        # request (a caret after 'Doe-Doe' once read as 'Doe-Doel' and spawned
+        # a phantom corrective item).
+        if self.executor.focused_once:
+            screenshot_b64, elements, change = self._parse_screen(decaret=True)
+        else:
+            # Pre-focus frame: the foreground window is NOT the target app
+            # (typically this agent's own UI), so OCR/YOLO would spend 5-12s
+            # of inference on elements that are useless by design — the first
+            # todo is always "focus the target application", and the actioner
+            # only needs list_windows for that. Capture a raw frame for the UI
+            # and start empty; the first real parse happens right after focus.
+            img, rect0 = capture_foreground()
+            img = img.convert("RGB")
+            if self.cfg.save_debug_screenshots:
+                self._save_debug(img)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
+            elements = []
+            change = ChangeSet()
+            # Prime the unchanged-screen fast path so observations BEFORE the
+            # focus succeeds (after list_windows etc.) also skip inference —
+            # the pre-focus window stays pixel-identical until focus_window
+            # swaps the foreground (rect change forces the first real parse).
+            self._prev_screenshot = img
+            self._last_elements = []
+            self._last_rect = rect0
         elements_text = self._format_elements(elements)
         self._last_ocr_signature = ocr_signature(elements)
 
@@ -4377,12 +4567,30 @@ def _load_config() -> AgentConfig:
         request_timeout = max(10, int(os.getenv("REQUEST_TIMEOUT", "120")))
     except ValueError:
         request_timeout = 120
+    # Supervisor output budget. REASONING models (thinking separated into
+    # reasoning_content by the server's --reasoning-parser) consume this budget
+    # on hidden thinking BEFORE emitting the update_plan tool call — 700 is
+    # plenty for direct-answer models but truncates thinkers to an empty
+    # response (finish_reason=length). Raise to ~4096 for reasoning supervisors.
+    try:
+        navigator_max_tokens = max(200, int(os.getenv("NAVIGATOR_MAX_TOKENS", "700")))
+    except ValueError:
+        navigator_max_tokens = 700
+    # Actioner output budget — same reasoning-model consideration as above:
+    # hidden thinking counts against it, so a thinking actioner needs room to
+    # reason AND still emit its tool call(s).
+    try:
+        actioner_max_tokens = max(200, int(os.getenv("ACTIONER_MAX_TOKENS", "1024")))
+    except ValueError:
+        actioner_max_tokens = 1024
     return AgentConfig(
         endpoint=endpoint, api_key=api_key, model=model,
         use_navigator=use_navigator, use_narrator=use_narrator,
         continue_session=continue_session, navigator_model=navigator_model,
         subtask_max_iterations=subtask_budget,
         request_timeout=request_timeout,
+        navigator_max_tokens=navigator_max_tokens,
+        max_tokens=actioner_max_tokens,
     )
 
 

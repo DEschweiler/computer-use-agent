@@ -260,13 +260,23 @@ def start_task():
         agent_process.start()
 
     def forward_logs():
+        # NOTE: a quiet gap is NOT an error — a reasoning-model LLM call can
+        # legitimately produce no log line for minutes. The forwarder must only
+        # exit on [DONE] or when the agent process is actually gone; breaking
+        # on queue.Empty (as this once did) silently froze the activity feed
+        # for the rest of the run while the agent kept working.
         while True:
             try:
                 msg = mp_log_queue.get(timeout=30)
-                log_queue.put(msg)
-                if msg == '[DONE]':
+            except queue.Empty:
+                proc = agent_process
+                if proc is None or not proc.is_alive():
                     break
+                continue
             except Exception:
+                break
+            log_queue.put(msg)
+            if msg == '[DONE]':
                 break
 
     threading.Thread(target=forward_logs, daemon=True).start()
@@ -435,6 +445,59 @@ def select_model():
     _selected_profile = prof
     print(f"[API] Actioner profile selected: {prof}")
     return jsonify({'status': 'ok', 'active': prof})
+
+
+# --- Cursor speed ---------------------------------------------------------- #
+# How fast the agent's cursor travels to a click target: 1 = a deliberate crawl,
+# 100 = near-instant. Floored at 1 rather than 0 because 0% would read as "the
+# cursor doesn't move", which is never what it means. Kept in a file the agent
+# re-reads on every glide rather than in env only, so dragging the slider takes
+# effect during a running task and not just on the next one.
+
+_SPEED_DEFAULT = 30.0
+_SPEED_MIN = 1.0
+
+
+def _cursor_speed_path():
+    return os.path.join(_temp_dir(), 'agent_cursor_speed.txt')
+
+
+def _cursor_speed_default():
+    """Fall back to .env / process env, matching agent.py's own default."""
+    try:
+        return max(_SPEED_MIN, min(100.0, float(_env_config().get('MOUSE_GLIDE_SPEED_PCT', _SPEED_DEFAULT))))
+    except (TypeError, ValueError):
+        return _SPEED_DEFAULT
+
+
+@app.route('/api/cursor_speed')
+def get_cursor_speed():
+    """Current cursor speed, 1 (slowest) - 100 (near-instant)."""
+    try:
+        with open(_cursor_speed_path(), encoding='utf-8') as fh:
+            value = max(_SPEED_MIN, min(100.0, float(fh.read().strip())))
+    except (OSError, ValueError):
+        value = _cursor_speed_default()
+    return jsonify({'speed': value, 'min': _SPEED_MIN})
+
+
+@app.route('/api/cursor_speed', methods=['POST'])
+def set_cursor_speed():
+    data = request.json or {}
+    try:
+        value = float(data.get('speed'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'speed must be a number'}), 400
+    value = max(_SPEED_MIN, min(100.0, value))
+    try:
+        with open(_cursor_speed_path(), 'w', encoding='utf-8') as fh:
+            fh.write(f'{value:.1f}')
+    except OSError as exc:
+        return jsonify({'error': f'could not persist cursor speed: {exc}'}), 500
+    # Also seed the env, so a task spawned before the file is read still agrees.
+    os.environ['MOUSE_GLIDE_SPEED_PCT'] = f'{value:.1f}'
+    print(f"[API] Cursor speed set to {value:.0f}%")
+    return jsonify({'status': 'ok', 'speed': value})
 
 
 if __name__ == '__main__':

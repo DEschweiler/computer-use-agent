@@ -16,6 +16,7 @@ const EVENT_META = {
   objective: { icon: '🎯', cls: 'ev-objective' },
   nav:       { icon: '⚠',  cls: 'ev-nav' },
   supervise: { icon: '🧭', cls: 'ev-supervise' },
+  retry:     { icon: '⏳', cls: 'ev-retry' },
   intervene: { icon: '🛑', cls: 'ev-intervene' },
   todo:      { icon: '📋', cls: 'ev-todo' },
   action:    { icon: '⚙',  cls: 'ev-action' },
@@ -31,6 +32,26 @@ const TODO_MARKS = { pending: '○', in_progress: '▶', done: '✓', failed: '�
 // Strip the "HH:MM:SS | LEVEL   | " prefix the backend log formatter prepends.
 function stripPrefix(line) {
   return line.replace(/^\d{2}:\d{2}:\d{2}\s*\|\s*\w+\s*\|\s*/, '');
+}
+
+// Cursor speed: how fast the agent's pointer travels to a click target.
+// 1% = a deliberate crawl, 100% = near-instant. Live — the agent re-reads it
+// mid-run, so it stays enabled while a task is running.
+function CursorSpeedSlider({ value, min, onChange }) {
+  const readout = `${Math.round(value)}%`;
+  return (
+    <div className="speed-picker" title="How fast the agent's cursor travels to a click target">
+      <span className="model-picker-label">Cursor Speed</span>
+      <input
+        type="range"
+        className="speed-range"
+        min={min} max="100" step="1"
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+      />
+      <span className="speed-readout">{readout}</span>
+    </div>
+  );
 }
 
 // A styled model picker. `value` is a profile id (or 'SAME' when includeSame).
@@ -113,6 +134,8 @@ function App() {
   const [models, setModels] = useState([]);
   const [activeProfile, setActiveProfile] = useState('');
   const [navActiveProfile, setNavActiveProfile] = useState('SAME');
+  const [cursorSpeed, setCursorSpeed] = useState(30);
+  const [cursorSpeedMin, setCursorSpeedMin] = useState(1);
 
   // Supervisor (header) state, parsed from [NAV] markers.
   const [goal, setGoal] = useState('');
@@ -127,6 +150,7 @@ function App() {
   const messagesEndRef = useRef(null);
   const logsEndRef = useRef(null);
   const timelineEndRef = useRef(null);
+  const todosEndRef = useRef(null);
   const eventSourceRef = useRef(null);
   const screenshotTimerRef = useRef(null);
   const iterRef = useRef(0);
@@ -144,6 +168,22 @@ function App() {
     const id = setInterval(loadModels, 15000);  // refresh availability
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    fetch(`${API}/api/cursor_speed`).then(r => r.json()).then(d => {
+      if (typeof d.speed === 'number') setCursorSpeed(d.speed);
+      if (typeof d.min === 'number') setCursorSpeedMin(d.min);
+    }).catch(() => {});
+  }, []);
+
+  const handleCursorSpeedChange = (speed) => {
+    setCursorSpeed(speed);  // move the thumb immediately; the POST is fire-and-forget
+    fetch(`${API}/api/cursor_speed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speed }),
+    }).catch(() => {});
+  };
 
   const handleSelectModel = (profile, role = 'actioner') => {
     if (role === 'navigator') setNavActiveProfile(profile);
@@ -167,6 +207,9 @@ function App() {
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
   useEffect(() => { if (debugOpen) logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [debugLogs, debugOpen]);
   useEffect(() => { timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [timeline]);
+  // Keep the newest todos in view — the active item is always near the bottom
+  // of a growing plan. block:'nearest' scrolls only the panel body, not the page.
+  useEffect(() => { todosEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [todos]);
 
   const closeEventSource = () => {
     if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
@@ -220,6 +263,8 @@ function App() {
       pushEvent('todo', msg.replace('[TODO]', '').trim());
     } else if (msg.startsWith('[SUPERVISE]')) {
       pushEvent('supervise', `Supervisor: ${msg.replace('[SUPERVISE]', '').trim()}`);
+    } else if (msg.startsWith('[RETRY]')) {
+      pushEvent('retry', msg.replace('[RETRY]', '').trim());
     } else if (msg.startsWith('[NAV]')) {
       if (msg.includes('objective:')) {
         const obj = msg.split('objective:').pop().trim();
@@ -332,6 +377,7 @@ function App() {
           </div>
         </div>
         <div className="header-actions">
+          <CursorSpeedSlider value={cursorSpeed} min={cursorSpeedMin} onChange={handleCursorSpeedChange} />
           {/* Actioner (and narrator) consume screenshots → vision profiles only.
               Supervisor is text-only reasoning → every profile qualifies. */}
           <ModelDropdown
@@ -389,6 +435,7 @@ function App() {
                   <div className="issue-text">⚠ {issue}</div>
                 </>
               )}
+              <div ref={todosEndRef} />
             </div>
           </section>
 

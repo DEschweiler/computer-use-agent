@@ -56,6 +56,30 @@ body {
 .model-dot.on  { background: #22c55e; box-shadow: 0 0 8px #22c55e; }        /* online: green */
 .model-dot.off { background: #6b7280; box-shadow: 0 0 6px rgba(107,114,128,0.5); }  /* offline: gray */
 
+/* Cursor speed slider */
+.speed-picker { display: flex; align-items: center; gap: 0.5rem; }
+.speed-range {
+  -webkit-appearance: none; appearance: none;
+  width: 84px; height: 4px; border-radius: 2px; background: #333;
+  outline: none; cursor: pointer;
+}
+.speed-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: #e5e7eb; border: none; cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.speed-range::-moz-range-thumb {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: #e5e7eb; border: none; cursor: pointer;
+}
+.speed-range:hover::-webkit-slider-thumb { background: #fff; box-shadow: 0 0 8px rgba(255,255,255,0.35); }
+.speed-range:hover::-moz-range-thumb { background: #fff; box-shadow: 0 0 8px rgba(255,255,255,0.35); }
+.speed-readout {
+  font-size: 0.72rem; color: #9ca3af; font-variant-numeric: tabular-nums;
+  min-width: 3.6em;  /* reserve room for 'instant' so the header doesn't jitter */
+}
+
 /* Custom model dropdown (native <select> can't show per-option status) */
 .model-dropdown { position: relative; }
 .model-trigger {
@@ -298,6 +322,7 @@ body {
 .tl-event.ev-objective { border-left-color: #f59e0b; color: #fcd34d; background: rgba(245,158,11,0.10); font-weight: 600; }
 .tl-event.ev-nav       { border-left-color: #f59e0b; color: #fcd34d; background: rgba(245,158,11,0.08); }
 .tl-event.ev-supervise { border-left-color: #f59e0b; color: #fbbf24; background: rgba(245,158,11,0.06); font-size: 0.8rem; }
+.tl-event.ev-retry     { border-left-color: #a855f7; color: #d8b4fe; background: rgba(168,85,247,0.08); font-size: 0.8rem; }
 .tl-event.ev-intervene { border-left-color: #ef4444; color: #fca5a5; background: rgba(239,68,68,0.12); font-weight: 600; }
 .tl-event.ev-todo      { border-left-color: #10b981; color: #6ee7b7; background: rgba(16,185,129,0.08); font-weight: 600; }
 
