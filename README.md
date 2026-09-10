@@ -65,6 +65,9 @@ Optional tuning via environment variables:
 | `YOLO_CONF_THRESH` | `0.05` | YOLO confidence threshold. |
 | `YOLO_IOU_THRESH` | `0.3` | IoU threshold for YOLO-internal NMS. |
 | `YOLO_OCR_OVERLAP_THRESH` | `0.05` | Fraction of an OCR box that a YOLO box must cover to be suppressed. |
+| `WAIT_MAX_S` | `300` | Ceiling for a single `wait()` call, in seconds. `0` removes the cap. A clipped request is reported to the model, never silently shortened. |
+| `MOUSE_GLIDE_SPEED_PCT` | `30` | Cursor speed, `1` (slowest) to `100` (near-instant), also settable live from the UI slider. |
+| `MOUSE_GLIDE` | `1` | `0` disables the cursor glide entirely — clicks jump straight to the target. |
 
 ### 4. Frontend dependencies
 

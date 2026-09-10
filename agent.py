@@ -269,6 +269,19 @@ log = logging.getLogger("agent")
 # executor never rejects an action for missing thought (we just log "(no
 # thought)"). This gives us structured reasoning without brittle enforcement.
 
+# Ceiling for a single wait() call; WAIT_MAX_S=0 removes it entirely. A wait
+# blocks the whole agent loop and the UI has nothing to show meanwhile, so the
+# cap is not about protecting the run — /api/stop terminates the child process
+# mid-sleep, so any wait is interruptible — it is about bounding how long a
+# *mistaken* wait (a model passing milliseconds, say) can look like a hang
+# before anyone notices. Clipped requests are reported, never silently
+# shortened, so the model can wait again rather than assume the time passed.
+_WAIT_MAX_S = float(os.getenv("WAIT_MAX_S", "300"))
+_WAIT_LIMIT_TXT = (
+    f"Default 1.5, maximum {_WAIT_MAX_S:.0f} per call — call wait again if you need longer."
+    if _WAIT_MAX_S > 0 else "Default 1.5, no maximum."
+)
+
 _THOUGHT_PARAM = {
     "type": "string",
     "description": (
@@ -400,14 +413,20 @@ COMPUTER_TOOLS = [
         "function": {
             "name": "wait",
             "description": (
-                "Wait a short period (e.g. for a dialog to appear, a slow save to complete). "
+                "Wait for a period (e.g. for a dialog to appear, a slow save to complete). "
                 "Default 1.5s. Use this when you expect the screen to change on its own — "
                 "the stuck-screen detector knows not to count waits against you."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "seconds": {"type": "number"},
+                    "seconds": {
+                        "type": "number",
+                        "description": (
+                            "How long to wait, in SECONDS (not milliseconds): 5 means five "
+                            f"seconds. {_WAIT_LIMIT_TXT}"
+                        ),
+                    },
                     "thought": _THOUGHT_PARAM,
                 },
                 "required": ["thought"],
@@ -1987,9 +2006,28 @@ class ActionExecutor:
                 return f"scrolled {scroll_clicks} clicks ({'up' if scroll_clicks > 0 else 'down'})"
 
             if action_type == "wait":
-                secs = float(args.get("seconds", 1.5))
-                time.sleep(min(secs, 10.0))
-                return f"waited {secs}s"
+                try:
+                    secs = float(args.get("seconds", 1.5))
+                except (TypeError, ValueError):
+                    return "error: 'seconds' must be a number of seconds (not milliseconds)"
+                if not math.isfinite(secs):
+                    return "error: 'seconds' must be a finite number"
+                secs = max(0.0, secs)
+                slept = min(secs, _WAIT_MAX_S) if _WAIT_MAX_S > 0 else secs
+                if slept >= 5:
+                    # Announce it up front: the loop is about to go silent, and a
+                    # quiet timeline is indistinguishable from a hung agent.
+                    log.info("   waiting %.1fs ...", slept)
+                time.sleep(slept)
+                if slept < secs:
+                    # Never report the requested time as elapsed: this string is
+                    # what the model and the UI timeline both read.
+                    return (
+                        f"waited {slept:.1f}s — the requested {secs:.1f}s exceeds the "
+                        f"{_WAIT_MAX_S:.0f}s limit for one call. NOTE the parameter is "
+                        "SECONDS, not milliseconds. Call wait again if you need longer."
+                    )
+                return f"waited {slept:.1f}s"
 
             if action_type == "list_windows":
                 return self._list_windows()
